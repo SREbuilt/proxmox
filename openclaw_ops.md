@@ -123,6 +123,77 @@ docker compose exec -it openclaw-gateway node openclaw.mjs agent --message "Hell
 
 ---
 
+## Model & Whisper Configuration
+
+### Change the AI model (Z.AI)
+
+```bash
+# Switch to a different Z.AI model (e.g. glm-4.7 instead of glm-5.1)
+docker compose exec openclaw-gateway node openclaw.mjs config set agents.defaults.model "zai/glm-4.7"
+docker compose restart openclaw-gateway
+```
+
+Available Z.AI models: `glm-5.1`, `glm-5`, `glm-5-turbo`, `glm-4.7`, `glm-4.7-flash`, `glm-4.6`, `glm-4.5`
+
+### Whisper voice transcription
+
+Voice messages from Telegram are transcribed by a local Whisper server
+running as a Docker container alongside OpenClaw (network_mode: host,
+CLI-based transcription to bypass SSRF restrictions).
+
+#### Change Whisper model size
+
+Edit `~/openclaw/docker-compose.yml`, find `WHISPER__MODEL` and change:
+
+| Model | RAM | Speed (N150) | Quality |
+|-------|-----|-------------|---------|
+| `tiny` | ~0.5 GB | Schnell | Ausreichend |
+| `base` | ~1 GB | Mittel | Gut |
+| `small` | ~2 GB | Langsam | Sehr gut |
+
+```bash
+nano ~/openclaw/docker-compose.yml
+# Change: WHISPER__MODEL=base → WHISPER__MODEL=small (or tiny)
+docker compose down whisper && docker compose up -d whisper
+```
+
+**Wichtig:** Bei `small` VM-RAM auf 6GB erhöhen (vom Proxmox Host):
+```bash
+qm set 100 --memory 6144
+qm reboot 100
+```
+
+#### Change Whisper language
+
+Edit `~/.openclaw/openclaw.json`, find the audio `"args"` array and
+add/change the language parameter:
+
+```bash
+nano ~/.openclaw/openclaw.json
+# Find: "-F", "response_format=text"]
+# Replace with: "-F", "response_format=text", "-F", "language=de"]
+docker compose restart openclaw-gateway
+```
+
+Supported languages: `de`, `en`, `fr`, `es`, `it`, `pt`, `nl`, `ja`, `zh`, etc.
+Setting the language explicitly improves recognition accuracy significantly.
+
+#### Test Whisper manually
+
+```bash
+# Check Whisper is running
+curl -sf http://127.0.0.1:8000/health
+
+# Test transcription with a file
+curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F "file=@/path/to/audio.ogg" \
+  -F "model=Systran/faster-whisper-base" \
+  -F "response_format=text" \
+  -F "language=de"
+```
+
+---
+
 ## Docker Container Management
 
 Run these from the VM (`~/openclaw`):
