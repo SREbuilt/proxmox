@@ -377,28 +377,46 @@ Navigiere im BIOS mit den Pfeiltasten (`←→` = Reiter, `↑↓` = Einträge,
 
 #### 1. C-States deaktivieren (WICHTIGSTE Änderung!)
 
-**Pfad:** `Advanced` → `Power & Performance` → `CPU - Power Management Control`
+**Pfad:** `Advanced` → `CPU Configuration`
+
+> ℹ️ **Stand 2026-04-17 (aus BIOS-Screenshots verifiziert):** Dieses Board
+> hat ein **vereinfachtes BIOS** — es gibt keinen separaten "CPU C States"-
+> Master-Schalter. Die einzige C-State-Einstellung ist **C6DRAM**.
 
 | Einstellung | Aktuell (Standard) | Empfohlen |
 |-------------|-------------------|-----------|
-| CPU C States | Enabled | **Disabled** |
-| C3 State / Package C State | Enabled/Auto | **Disabled** |
-| C6 / C7 State | Enabled/Auto | **Disabled** |
-| Enhanced Intel SpeedStep (EIST) | Enabled | Enabled (lassen) |
-| Intel Turbo Boost | Enabled | Enabled (lassen) |
+| **C6DRAM** | Enabled | **→ Disabled** |
+| **MonitorMWait** | Enabled | **→ Disabled** |
 
-> **Warum:** Die tiefen C-States (C6/C7+) verursachen die Kernel-Freezes.
+**Nicht ändern (lassen wie es ist):**
+
+| Einstellung | Wert | Warum nicht ändern |
+|-------------|------|-------------------|
+| Intel (VMX) Virtualization Technology | Enabled | Proxmox braucht das! |
+| Hardware Prefetcher | Enabled | Performance |
+| Adjacent Cache Line Prefetch | Enabled | Performance |
+| AVX | Enabled | Performance |
+| Active Efficient-cores | Enabled | N150 hat nur E-Cores |
+| AES | Enabled | Verschlüsselung |
+| MachineCheck | Enabled | Hardware-Fehler-Erkennung |
+| CPU SMM Enhancement | Default | Firmware-intern, nicht anfassen |
+
+> **Warum:** **C6DRAM** steuert den C6-Deep-Sleep-State, der die Kernel-
+> Freezes verursacht. **MonitorMWait** steuert den MWAIT-Befehl, über den
+> der Kernel tiefe C-States anfordert — deaktiviert = Kernel kann keine
+> tiefen C-States mehr anfordern.
+>
 > BIOS-seitig deaktivieren ist die erste Verteidigungslinie, die Kernel-
 > Parameter (`intel_idle.max_cstate=1`) sind die zweite. Beides zusammen
 > gibt maximale Sicherheit.
 >
-> SpeedStep und Turbo Boost können AKTIV bleiben — diese steuern nur die
-> Frequenz (800 MHz ↔ 3600 MHz), nicht die Schlafzustände.
+> SpeedStep und Turbo Boost werden hier nicht angezeigt — sie sind auf
+> diesem Board automatisch aktiv und steuern nur die Frequenz
+> (800 MHz ↔ 3600 MHz), nicht die Schlafzustände.
 
 #### 2. PCIe ASPM deaktivieren
 
-**Pfad:** `Advanced` → `Power & Performance` → `PCI Express Configuration`
-oder `Advanced` → `PCH Configuration`
+**Pfad:** `Advanced` → `PCI Subsystem Settings`
 
 | Einstellung | Aktuell | Empfohlen |
 |-------------|---------|-----------|
@@ -421,19 +439,46 @@ oder `Advanced` → `PCH Configuration`
 > **Warum:** Verhindert, dass USB-Geräte (Tastatur für Notfall-Recovery)
 > aus dem Schlaf nicht aufwachen.
 
-#### 4. Wake-on-LAN aktivieren
+#### 4. ACPI Sleep & Wake-on-LAN
 
-**Pfad:** `Advanced` → `Network Stack Configuration` oder `Chipset` → `PCH-IO`
+**Pfad:** `Advanced` → `ACPI Settings`
 
 | Einstellung | Aktuell | Empfohlen |
 |-------------|---------|-----------|
-| Wake on LAN | Disabled | **Enabled** |
-| ErP Ready (Energy-Related Products) | S5 | **Disabled** |
+| Enable ACPI Auto Configuration | Disabled ✅ | Lassen |
+| Enable Hibernation | Disabled ✅ | Lassen |
+| **ACPI Sleep State** | Suspend… | **→ Disabled** |
+| S5 Resume By RTC | Disabled | Lassen |
+| **Resume By Onboard LAN** | Disabled | **→ Enabled** |
+| I226 LAN PXE Boot Support | Disabled | Lassen |
 
-> **Warum:** Mit WoL kannst du den Mini-PC nach einem Stromausfall oder
-> gewolltem Shutdown remote starten (z.B. vom Handy über eine
-> Fritz!Box-App). **ErP/EuP muss dafür AUS sein** — sonst wird WoL im
-> S5-Zustand blockiert.
+> **Warum:**
+> - **ACPI Sleep State → Disabled** = Ein Proxmox-Server darf nie in den
+>   Suspend/Sleep gehen. Das kann zu Freeze-ähnlichem Verhalten führen
+>   und VMs in einen undefinierten Zustand bringen.
+> - **Resume By Onboard LAN → Enabled** = Wake-on-LAN! Damit kannst du
+>   den Mini-PC remote starten (z.B. über Fritz!Box-App, Handy-WoL-App
+>   oder von einem anderen Rechner mit `wakeonlan` / `etherwake`).
+
+**Nicht ändern:**
+
+| Einstellung | Warum lassen |
+|-------------|-------------|
+| ACPI Auto Configuration = Disabled | Standard, nicht nötig |
+| Hibernation = Disabled | Server soll nie hibernieren |
+| S5 Resume By RTC = Disabled | Nicht benötigt (nur für Zeitgesteuertes Aufwachen) |
+| PXE Boot = Disabled | Nicht benötigt (kein Netzwerk-Boot) |
+
+#### 5. Stromausfall-Verhalten (bereits korrekt!)
+
+**Pfad:** `Advanced` (Hauptmenü)
+
+| Einstellung | Aktuell | Status |
+|-------------|---------|--------|
+| **PWRON After Power Loss** | **Always On** ✅ | **Bereits korrekt!** |
+
+> Perfekt — der Mini-PC startet automatisch nach Stromausfall.
+> Diese Einstellung war bereits richtig gesetzt.
 
 #### 5. Boot-Einstellungen
 
@@ -529,14 +574,26 @@ update-grub
 Nach allen Änderungen `F4` drücken → "Save & Exit".
 
 ```
-✅ C-States:           DISABLED (verhindert Freezes)
-✅ ASPM:               DISABLED (verhindert NVMe/NIC Freezes)
-✅ USB Selective:       DISABLED (Recovery-Tastatur zuverlässig)
-✅ Wake on LAN:         ENABLED  (Remote-Start möglich)
-✅ ErP:                 DISABLED (WoL funktioniert)
-✅ Fast Boot:           DISABLED (GRUB-Menü erreichbar)
-✅ AC Power Loss:       POWER ON (Auto-Start nach Stromausfall)
-✅ SpeedStep/Turbo:     ENABLED  (Leistung bei Bedarf)
+Pfad: Advanced → CPU Configuration
+  ✅ C6DRAM:            DISABLED (verhindert C6-Deep-Sleep-Freezes)
+  ✅ MonitorMWait:       DISABLED (verhindert MWAIT C-State-Anforderung)
+
+Pfad: Advanced → PCI Subsystem Settings
+  ✅ ASPM:               DISABLED (verhindert NVMe/NIC Freezes)
+
+Pfad: Advanced → USB Configuration
+  ✅ USB Selective:       DISABLED (Recovery-Tastatur zuverlässig)
+
+Pfad: Advanced → ACPI Settings
+  ✅ ACPI Sleep State:    DISABLED (Server darf nie schlafen)
+  ✅ Resume By Onboard LAN: ENABLED (Wake-on-LAN für Remote-Start)
+
+Pfad: Advanced (Hauptmenü)
+  ✅ PWRON After Power Loss: ALWAYS ON (bereits korrekt gesetzt!)
+
+Pfad: Boot
+  ✅ Fast Boot:           DISABLED (POST erreichbar für Notfall)
+  ✅ Quiet Boot:          DISABLED (POST-Meldungen sichtbar)
 ```
 
 ### BIOS-Update
