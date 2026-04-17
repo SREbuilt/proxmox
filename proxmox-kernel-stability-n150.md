@@ -20,6 +20,8 @@ Linux-Power-States (C-States). Der Prozessor geht in tiefe Schlafzustände
 | Installierte Kernel | 6.8.12-4, 6.8.12-16, 6.14.11-4, 6.17.2-1 |
 | CPU | Intel N150 (Alder Lake-N) |
 | Intel Microcode | 3.20250812.1 |
+| Boot-Loader | **systemd-boot** (ZFS-Installation) — Stand 2026-04-17 |
+| Root-FS | ZFS (`rpool/ROOT/pve-1`) |
 
 ## Empfehlung
 
@@ -71,10 +73,35 @@ cp /etc/default/grub /root/grub.backup
 
 ### Phase 2: C-State-Limitierung setzen
 
-```bash
-# Aktuelle GRUB-Parameter anzeigen
-cat /etc/default/grub | grep CMDLINE
+> ℹ️ **Stand 2026-04-17:** Dieses System nutzt **systemd-boot mit ZFS**.
+> Die systemd-boot-Anleitung ist der primäre Pfad. Die GRUB-Anleitung
+> bleibt als Referenz erhalten, falls später auf GRUB umgestellt wird.
 
+```bash
+# Prüfe welcher Bootloader aktiv ist
+test -d /sys/firmware/efi && echo "UEFI (evtl. systemd-boot)" || echo "BIOS (GRUB)"
+```
+
+#### Option A: systemd-boot (ZFS) ← Dein aktuelles Setup
+
+```bash
+# Kernel-Parameter bearbeiten
+nano /etc/kernel/cmdline
+```
+
+Inhalt (eine Zeile):
+```
+root=ZFS=rpool/ROOT/pve-1 boot=zfs intel_idle.max_cstate=1 processor.max_cstate=1
+```
+
+Speichern und aktivieren:
+```bash
+proxmox-boot-tool refresh
+```
+
+#### Option B: GRUB (ext4/LVM) ← Falls später umgestellt
+
+```bash
 # GRUB-Parameter bearbeiten
 nano /etc/default/grub
 ```
@@ -89,20 +116,7 @@ Ersetze durch:
 GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_idle.max_cstate=1 processor.max_cstate=1"
 ```
 
-Speichern (`Ctrl+O`, `Enter`, `Ctrl+X`).
-
-**Falls dein System systemd-boot verwendet (ZFS-Installation):**
-```bash
-# Prüfe ob GRUB oder systemd-boot
-test -d /sys/firmware/efi && echo "UEFI (evtl. systemd-boot)" || echo "BIOS (GRUB)"
-
-# Für systemd-boot: Kernel-Parameter direkt setzen
-nano /etc/kernel/cmdline
-# Inhalt: root=ZFS=rpool/ROOT/pve-1 boot=zfs intel_idle.max_cstate=1 processor.max_cstate=1
-proxmox-boot-tool refresh
-```
-
-**Für GRUB:**
+Speichern und aktivieren:
 ```bash
 update-grub
 ```
@@ -435,46 +449,65 @@ oder `Advanced` → `PCH Configuration`
 
 > **Warum:**
 > - **Fast Boot Disabled** = Das BIOS überspringt die POST-Phase nicht,
->   sodass man per `DEL`/`F2` ins BIOS kommt und GRUB die Tastatur
->   erkennt. **Das betrifft NUR das BIOS, nicht GRUB!**
+>   sodass man per `DEL`/`F2` ins BIOS kommt. **Das betrifft NUR das
+>   BIOS, nicht den Bootloader!**
 > - **Quiet Boot Disabled** = POST-Meldungen sichtbar (Diagnose bei Problemen)
 > - **Restore on AC Power Loss = Power On** = Nach Stromausfall startet
 >   der Mini-PC automatisch → Proxmox + VMs laufen wieder
 >
 > ⚠️ **Wichtig: Der Boot-Ablauf ist vollautomatisch!**
 >
+> **systemd-boot (dein Setup, Stand 2026-04-17):**
 > ```
 > Stromausfall → Strom kommt zurück
 >   → BIOS startet automatisch (AC Power Loss = Power On)
 >     → BIOS POST-Phase (5-10 Sek, Fast Boot OFF = Tastatur erreichbar)
->       → GRUB startet automatisch
->         → GRUB Timeout (5 Sek) → bootet gepinnten Kernel automatisch
->           → Proxmox startet → VMs starten (wenn onboot=1)
+>       → systemd-boot → bootet gepinnten Kernel SOFORT (kein Menü!)
+>         → Proxmox startet → VMs starten (wenn onboot=1)
 > ```
+> systemd-boot zeigt standardmäßig **kein Menü** — der gepinnte Kernel
+> wird sofort gebootet. Für Notfall-Zugang: beim Booten `Space` oder
+> `↓` gedrückt halten, um das Boot-Menü zu erzwingen.
 >
-> GRUB zeigt zwar kurz das Menü (5 Sek), **bootet aber automatisch den
-> gepinnten Kernel** ohne Benutzer-Interaktion. Der Timeout ist nur da,
-> damit man im Notfall manuell einen anderen Kernel wählen KANN — man
-> muss es aber nicht.
+> **GRUB (falls später umgestellt):**
+> ```
+> … → GRUB startet → Timeout (5 Sek) → bootet gepinnten Kernel automatisch
+> ```
+> GRUB zeigt kurz das Menü, bootet aber automatisch nach dem Timeout.
 
-#### 5b. GRUB-Timeout anpassen (optional)
+#### 5b. Boot-Timeout anpassen (optional)
 
-Falls dir die 5 Sekunden GRUB-Wartezeit zu lang sind, kannst du sie
-verkürzen (aber nicht auf 0 setzen — sonst kein Notfall-Zugang!):
+**Für systemd-boot (dein Setup):**
+
+systemd-boot hat keinen sichtbaren Timeout — es bootet sofort.
+Falls du ein kurzes Menü möchtest (z.B. für Kernel-Auswahl):
 
 ```bash
-# Aktuellen Timeout anzeigen
-grep GRUB_TIMEOUT /etc/default/grub
+# loader.conf erstellen/bearbeiten
+nano /efi/loader/loader.conf
+# oder je nach Mount:
+nano /boot/efi/loader/loader.conf
+```
 
+Inhalt:
+```
+timeout 3
+```
+
+```bash
+proxmox-boot-tool refresh
+```
+
+**Für GRUB (falls später umgestellt):**
+
+```bash
 # Auf 2 Sekunden setzen (Kompromiss: schnell, aber Notfall möglich)
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' /etc/default/grub
 update-grub
-# oder für systemd-boot:
-# proxmox-boot-tool refresh
 ```
 
-> **Empfehlung:** `GRUB_TIMEOUT=3` — schnell genug für Auto-Boot,
-> lang genug um im Notfall `↓` drücken zu können.
+> **Empfehlung:** Timeout bei systemd-boot auf **0 lassen** (sofort booten).
+> Im Notfall `Space` beim Booten gedrückt halten für Kernel-Auswahl.
 
 #### 6. Thermik prüfen
 
