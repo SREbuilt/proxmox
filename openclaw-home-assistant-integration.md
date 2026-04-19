@@ -549,13 +549,20 @@ Kein Firewall-Thema — nur Skill + Credentials nötig:
 ### Übersicht
 
 Beide Tennisvereine nutzen das **ep-3 Buchungssystem** (hbsys.de) mit
-identischer Web-Oberfläche. OpenClaw greift über `curl` + HTML-Parsing
-auf die öffentlichen Kalenderseiten zu.
+identischer Web-Oberfläche. Der Tennis-Skill ist auf beiden AI-Assistenten
+identisch installiert — gleiche Scripts, gleiche Credentials.
 
 | Verein | URL | Plätze | Zeiten |
 |--------|-----|--------|--------|
 | TC Kleinberghofen | buchen.tc-kleinberghofen.de | 2 | 06:00–22:00 |
 | TC Erdweg | tennis-erdweg-online.de | 6 | 08:00–21:00 |
+
+### Installiert auf
+
+| System | Skill-Pfad | Credentials |
+|--------|-----------|-------------|
+| **OpenClaw** (VM 100) | `~/.openclaw/workspace/skills/tennis-booking/` | `~/.openclaw/.credentials.env` |
+| **Hermes** (VM 101) | `~/.hermes/skills/leisure/tennis-booking/` | `~/.hermes/.env` |
 
 ### Funktionen
 
@@ -568,65 +575,43 @@ auf die öffentlichen Kalenderseiten zu.
 
 ### Einrichtung
 
-Der Tennis-Skill wurde als **lokaler Skill** im Workspace erstellt.
+Der Tennis-Skill ist als **lokaler Skill** auf beiden Systemen installiert.
 
-#### 1. Skill-Verzeichnis erstellen (bereits erledigt)
-
-```bash
-mkdir -p ~/.openclaw/workspace/skills/tennis-booking/scripts
-```
-
-#### 2. SKILL.md und Script wurden direkt im Skill-Ordner erstellt:
+#### OpenClaw (VM 100)
 
 ```
 ~/.openclaw/workspace/skills/tennis-booking/
-├── SKILL.md             ← Skill-Beschreibung mit ep-3 Referenz
+├── SKILL.md             ← OpenClaw Skill-Format (YAML Frontmatter)
 └── scripts/
     └── tennis.sh        ← CLI: check, details, book
 ```
 
-> **Nicht verwechseln** mit der alten Datei `~/.openclaw/bin/tennis.sh`.
-> Der Skill liegt unter `workspace/skills/tennis-booking/scripts/tennis.sh`.
+Credentials: In `~/.openclaw/.credentials.env`
+Restart: `cd ~/openclaw && docker compose restart openclaw-gateway`
 
-#### 3. Credentials in .credentials.env ergänzen
+#### Hermes (VM 101)
+
+```
+~/.hermes/skills/leisure/tennis-booking/
+├── SKILL.md             ← Hermes Skill-Format (mit tags + prerequisites)
+└── scripts/
+    └── tennis.sh        ← Gleiche CLI wie OpenClaw
+```
+
+Credentials: In `~/.hermes/.env`
+Restart: `cd ~/hermes && docker compose restart hermes`
+
+#### Credentials-Format (beide Systeme)
 
 ```bash
-cat >> ~/.openclaw/.credentials.env << 'EOF'
-
-# Tennis-Buchung (ep-3 System)
 TENNIS_KB_EMAIL=deine-email@example.com
 TENNIS_KB_PASS=dein-kleinberghofen-passwort
 TENNIS_ER_EMAIL=deine-email@example.com
 TENNIS_ER_PASS=dein-erdweg-passwort
-EOF
-
-chmod 600 ~/.openclaw/.credentials.env
 ```
 
 > Gleiche E-Mail für beide Vereine möglich, Passwörter können
 > unterschiedlich sein.
-
-#### 4. boot.md aktualisieren
-
-Ergänze in `~/.openclaw/boot.md`:
-
-```markdown
-### Tennis-Platzbuchung (ep-3 Skill)
-- Skill: ~/.openclaw/workspace/skills/tennis-booking/
-- Script: tennis.sh (im Skill scripts/ Ordner)
-- Vereine: kb = Kleinberghofen (2 Plätze), er = Erdweg (6 Plätze)
-- Env-Vars: TENNIS_KB_EMAIL, TENNIS_KB_PASS, TENNIS_ER_EMAIL, TENNIS_ER_PASS
-- Verfügbarkeit: tennis.sh check [kb|er] [YYYY-MM-DD]
-- Details: tennis.sh details [kb|er] YYYY-MM-DD HH:MM PLATZ
-- Buchen: tennis.sh book [kb|er] YYYY-MM-DD HH:MM PLATZ
-- Internet-Seiten, kein Firewall-Thema
-```
-
-#### 4. Restart
-
-```bash
-cd ~/openclaw && docker compose restart openclaw-gateway
-```
 
 ### Nutzung via Telegram
 

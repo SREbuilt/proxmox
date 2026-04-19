@@ -396,15 +396,52 @@ ssh hermes@192.168.178.81 "curl -sf --max-time 3 http://192.168.178.108:8006 2>/
 
 ```
 ~/.hermes/
-├── .env            ← API keys (GLM_API_KEY, HA_TOKEN, TELEGRAM_BOT_TOKEN)
+├── .env            ← API keys (GLM_API_KEY, HA_TOKEN, TELEGRAM_BOT_TOKEN, TENNIS_*)
 ├── config.yaml     ← Settings (model, terminal, memory, tools)
 ├── SOUL.md         ← Agent personality/identity
 ├── memories/       ← Persistent memory (auto-managed)
-├── skills/         ← Agent-created skills
+├── skills/         ← Bundled + custom skills
+│   └── leisure/
+│       └── tennis-booking/   ← Tennis-Platzbuchung
+│           ├── SKILL.md
+│           └── scripts/tennis.sh
 ├── sessions/       ← Conversation history
 ├── cron/           ← Scheduled jobs
 ├── hooks/          ← Event hooks
 └── logs/           ← Runtime logs
+```
+
+### Hermes Skills
+
+Hermes organisiert Skills in **Kategorien** (Ordner) unter `~/.hermes/skills/`.
+
+| Kategorie | Skill | Funktion |
+|-----------|-------|----------|
+| `smart-home/` | `openhue` | Philips Hue Steuerung |
+| `leisure/` | `find-nearby` | Orte in der Nähe finden |
+| `leisure/` | **`tennis-booking`** | **Tennisplatz-Verfügbarkeit & Buchung** |
+
+**Skill-Format (SKILL.md):**
+```yaml
+---
+name: skill-name
+description: Wann der Skill genutzt werden soll.
+version: 1.0.0
+metadata:
+  hermes:
+    tags: [Tag1, Tag2]
+prerequisites:
+  commands: [curl]
+  environment_variables: [VAR1, VAR2]
+---
+# Dokumentation + Beispiele...
+```
+
+**Eigenen Skill hinzufügen:**
+```bash
+mkdir -p ~/.hermes/skills/<kategorie>/<skill-name>/scripts
+# SKILL.md + scripts/ erstellen
+# Hermes findet neue Skills automatisch (kein Restart nötig)
 ```
 
 ### Hermes CLI (inside VM)
