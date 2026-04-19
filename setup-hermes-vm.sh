@@ -284,23 +284,8 @@ write_files:
         hermes-net:
           driver: bridge
 
-  # Hermes .env (API keys and secrets)
-  # NOTE: permissions 0644 so the Docker container can read it
-  # (container runs as different UID than host user)
-  - path: /home/${USER}/.hermes/.env
-    owner: ${USER}:${USER}
-    permissions: '0644'
-    content: |
-      GLM_API_KEY=${ZAI_KEY}
-      HA_URL=${HA_URL}
-      HA_TOKEN=${HA_TOKEN}
-      GRAFANA_URL=${GRAFANA_URL}
-      TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
-      GATEWAY_ALLOW_ALL_USERS=true
-
-  # Hermes config.yaml — only override the values that differ from defaults
-  # The container generates a full default config.yaml on first boot;
-  # we overwrite it AFTER first boot via runcmd (see below).
+  # NOTE: .env is NOT written via write_files (newlines get lost during
+  # shell heredoc expansion). It's written via runcmd printf instead.
 
   # SOUL.md — Agent personality
   - path: /home/${USER}/.hermes/SOUL.md
@@ -324,6 +309,16 @@ write_files:
       - Du läufst auf einer gesicherten Proxmox-VM mit eingeschränktem LAN-Zugang
 
 runcmd:
+  # Write .env via printf (cloud-init write_files loses newlines with heredoc vars)
+  - printf 'GLM_API_KEY=${ZAI_KEY}\nHA_URL=${HA_URL}\nHA_TOKEN=${HA_TOKEN}\nGRAFANA_URL=${GRAFANA_URL}\nTELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}\nGATEWAY_ALLOW_ALL_USERS=true\n' > /home/${USER}/.hermes/.env
+  - chown ${USER}:${USER} /home/${USER}/.hermes/.env
+  - chmod 644 /home/${USER}/.hermes/.env
+
+  # Enable password auth for SSH (fallback if key injection fails)
+  - sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+  - bash -c "echo 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/99-allow-password.conf"
+  - systemctl restart sshd
+
   # Disable IPv6 (prevent firewall bypass)
   - sysctl -w net.ipv6.conf.all.disable_ipv6=1
   - sysctl -w net.ipv6.conf.default.disable_ipv6=1
@@ -359,13 +354,21 @@ runcmd:
   - sed -i '0,/^  provider:/s/^  provider:.*/  provider: "zai"/' /home/${USER}/.hermes/config.yaml || true
   - grep -q '^  provider:' /home/${USER}/.hermes/config.yaml || sed -i '/^model:/a\  provider: "zai"' /home/${USER}/.hermes/config.yaml
 
-  # Fix permissions (Docker container needs read access)
+  # Fix permissions (Docker container changes ownership)
   - chown -R ${USER}:${USER} /home/${USER}/.hermes
+  - chmod -R u+rw /home/${USER}/.hermes
   - chmod 755 /home/${USER}/.hermes
   - chmod 644 /home/${USER}/.hermes/.env /home/${USER}/.hermes/config.yaml
 
   # Restart hermes with correct config
   - su - ${USER} -c 'cd ~/hermes && docker compose restart hermes'
+  - sleep 10
+
+  # Final permissions fix (Docker may have changed them again)
+  - chown -R ${USER}:${USER} /home/${USER}/.hermes
+  - chmod -R u+rw /home/${USER}/.hermes
+  - chmod 755 /home/${USER}/.hermes
+  - chmod 644 /home/${USER}/.hermes/.env /home/${USER}/.hermes/config.yaml
 
   # Enable qemu-guest-agent
   - systemctl enable --now qemu-guest-agent
