@@ -154,7 +154,7 @@ qm create "$VM_ID" \
     --ostype l26 \
     --cores 2 \
     --memory "$RAM" \
-    --cpu cputype=host \
+    --cpu cputype=x86-64-v2-AES \
     --net0 "virtio,bridge=${BRIDGE},firewall=0" \
     --scsihw virtio-scsi-single \
     --vga std \
@@ -285,55 +285,22 @@ write_files:
           driver: bridge
 
   # Hermes .env (API keys and secrets)
+  # NOTE: permissions 0644 so the Docker container can read it
+  # (container runs as different UID than host user)
   - path: /home/${USER}/.hermes/.env
-    owner: ${USER}:${USER}
-    permissions: '0600'
-    content: |
-      # Z.AI native provider
-      GLM_API_KEY=${ZAI_KEY}
-      # Home Assistant
-      HA_URL=${HA_URL}
-      HA_TOKEN=${HA_TOKEN}
-      # Grafana
-      GRAFANA_URL=${GRAFANA_URL}
-      # Telegram (if configured)
-      TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
-
-  # Hermes config.yaml
-  - path: /home/${USER}/.hermes/config.yaml
     owner: ${USER}:${USER}
     permissions: '0644'
     content: |
-      # Hermes Agent Configuration
-      # VM: ${VM_ID}, IP: ${VM_IP}
-      # Generated: $(date -Iseconds)
+      GLM_API_KEY=${ZAI_KEY}
+      HA_URL=${HA_URL}
+      HA_TOKEN=${HA_TOKEN}
+      GRAFANA_URL=${GRAFANA_URL}
+      TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
+      GATEWAY_ALLOW_ALL_USERS=true
 
-      model: "zai/glm-4.7"
-
-      terminal:
-        backend: local
-        cwd: "/home/${USER}/workspace"
-        timeout: 180
-
-      gateway:
-        auth_token: "${GW_TOKEN}"
-
-      memory:
-        enabled: true
-        auto_save: true
-
-      compression:
-        enabled: true
-        model: "zai/glm-4.7-flash"
-
-      tts:
-        enabled: false
-
-      tools:
-        web_search: true
-        browser: false
-        image_generation: false
-        text_to_speech: false
+  # Hermes config.yaml — only override the values that differ from defaults
+  # The container generates a full default config.yaml on first boot;
+  # we overwrite it AFTER first boot via runcmd (see below).
 
   # SOUL.md — Agent personality
   - path: /home/${USER}/.hermes/SOUL.md
@@ -382,9 +349,23 @@ runcmd:
   - mkdir -p /home/${USER}/.hermes/logs
   - chown -R ${USER}:${USER} /home/${USER}
 
-  # Pull and start Hermes
+  # Pull and start Hermes (first boot generates default config.yaml)
   - su - ${USER} -c 'cd ~/hermes && docker compose pull --quiet'
   - su - ${USER} -c 'cd ~/hermes && docker compose up -d'
+  - sleep 20
+
+  # Patch config.yaml: set Z.AI provider + model (after default config is generated)
+  - sed -i 's/default:.*"anthropic\/.*"/default: "glm-4.7"/' /home/${USER}/.hermes/config.yaml
+  - sed -i '0,/^  provider:/s/^  provider:.*/  provider: "zai"/' /home/${USER}/.hermes/config.yaml || true
+  - grep -q '^  provider:' /home/${USER}/.hermes/config.yaml || sed -i '/^model:/a\  provider: "zai"' /home/${USER}/.hermes/config.yaml
+
+  # Fix permissions (Docker container needs read access)
+  - chown -R ${USER}:${USER} /home/${USER}/.hermes
+  - chmod 755 /home/${USER}/.hermes
+  - chmod 644 /home/${USER}/.hermes/.env /home/${USER}/.hermes/config.yaml
+
+  # Restart hermes with correct config
+  - su - ${USER} -c 'cd ~/hermes && docker compose restart hermes'
 
   # Enable qemu-guest-agent
   - systemctl enable --now qemu-guest-agent

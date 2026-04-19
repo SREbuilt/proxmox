@@ -335,12 +335,23 @@ With Telegram:
 
 The script will:
 - Download Debian 12 cloud image (cached, shared with OpenClaw)
-- Create VM 101 with 3GB RAM, 2 cores, 16GB disk
+- Create VM 101 with 3GB RAM, 2 cores, 16GB disk (CPU: x86-64-v2-AES)
 - Configure Proxmox firewall (blocks LAN, allows HA + Grafana + internet)
-- Deploy Hermes via Docker Compose (gateway + dashboard)
+- Deploy Hermes via Docker Compose (gateway + dashboard, bridge network)
 - Disable IPv6 (prevent firewall bypass)
+- Let Hermes generate its default `config.yaml`, then patch model + provider
+- Fix file permissions (`644` for `.env` — Docker container needs read access)
 - Enable NIC firewall after setup completes
 - Wait for health check
+
+> **Bekannte Eigenheiten:**
+> - **CPU-Typ**: `x86-64-v2-AES` statt `host` (Kernel Panic mit `host` auf N150)
+> - **config.yaml**: Hermes generiert beim ersten Start eine vollständige Default-Config.
+>   Das Script patcht `model` und `provider` nachträglich via `sed`.
+> - **.env Permissions**: Muss `644` sein (nicht `600`), da der Docker-Container
+>   als anderer UID läuft und die Datei lesen muss.
+> - **GATEWAY_ALLOW_ALL_USERS**: Ist auf `true` gesetzt, damit Telegram sofort
+>   funktioniert. Für Produktion: durch User-Allowlists ersetzen.
 
 #### 3. Access Hermes (via SSH tunnel)
 
@@ -430,6 +441,65 @@ docker compose restart hermes
 # Backup (.hermes contains all state)
 tar czf ~/hermes-backup-$(date +%Y%m%d).tar.gz ~/.hermes/
 ```
+
+### Hermes Troubleshooting
+
+#### Kernel Panic beim Booten
+```bash
+# CPU-Typ auf x86-64-v2-AES setzen (host verursacht Kernel Panic auf N150)
+qm stop 101
+qm set 101 --cpu cputype=x86-64-v2-AES
+qm start 101
+```
+
+#### SSH "Permission denied (publickey)"
+```bash
+# SSH-Key manuell injizieren (vom Proxmox Host)
+qm guest exec 101 -- mkdir -p /home/hermes/.ssh
+qm guest exec 101 -- bash -c "echo '$(cat /root/.ssh/id_ed25519.pub)' > /home/hermes/.ssh/authorized_keys"
+qm guest exec 101 -- chown -R hermes:hermes /home/hermes/.ssh
+qm guest exec 101 -- chmod 700 /home/hermes/.ssh
+qm guest exec 101 -- chmod 600 /home/hermes/.ssh/authorized_keys
+
+# Password-Auth aktivieren (falls Key nicht funktioniert)
+qm guest exec 101 -- bash -c "echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config.d/60-cloudimg-settings.conf"
+qm guest passwd 101 hermes
+qm reboot 101
+```
+
+#### "Permission denied: /opt/data/.env" im Container
+```bash
+# .env muss 644 sein (nicht 600), da Docker-Container als anderer UID läuft
+chmod 644 ~/.hermes/.env
+docker compose restart hermes
+```
+
+#### "Unknown Model" Fehler
+```bash
+# Model muss "glm-4.7" sein (nicht "zai/glm-4.7" oder "openai/glm-4.7")
+# Provider muss separat auf "zai" stehen
+grep -A3 "^model:" ~/.hermes/config.yaml
+# Erwartet: default: "glm-4.7" und provider: "zai"
+
+# Falls falsch:
+sed -i 's/default:.*".*"/default: "glm-4.7"/' ~/.hermes/config.yaml
+# Provider-Zeile finden und auf "zai" setzen
+docker compose restart hermes
+```
+
+#### Container startet aber .hermes Permissions kaputt
+```bash
+sudo chown -R hermes:hermes ~/.hermes
+sudo chmod 755 ~/.hermes
+sudo chmod 644 ~/.hermes/.env ~/.hermes/config.yaml
+docker compose restart
+```
+
+#### HA-Token nicht verfügbar im Agent
+Hermes liest `HA_TOKEN` aus `.env`, macht sie aber nicht automatisch in
+der Shell verfügbar. Der Agent muss `$HA_TOKEN` explizit aus der Umgebung
+lesen. Wenn Hermes nach dem Token fragt, einfach mitteilen — er merkt
+es sich dann in seinem persistenten Memory.
 
 ---
 
