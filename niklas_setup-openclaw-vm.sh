@@ -1,354 +1,193 @@
-#!/usr/bin/env bash
+#!/bin/bash
 ###############################################################################
-# niklas_setup-openclaw-vm.sh — Hardened OpenClaw VM setup for Proxmox
+# niklas_setup-openclaw-vm.sh — Fire-and-forget OpenClaw VM on Proxmox
 #
-# Creates a Debian 12 cloud-init VM with Docker + OpenClaw container.
-# Full VM isolation, Proxmox firewall for LAN blocking, loopback-only port.
+# Strategy (same as proven Hermes v8 script):
+#   Phase 1: Proxmox-native cloud-init (user, SSH key, password, IP)
+#   Phase 2: Wait for boot (handle first-boot kernel panic automatically)
+#   Phase 3: SSH into VM → install Docker → deploy OpenClaw + Whisper
 #
-# Lessons learned and applied:
-#   - Uses debian-12-generic (NOT genericcloud — NIC detection issues)
-#   - VGA=std (NOT serial0 — cloud image doesn't output to serial)
-#   - Firewall starts DISABLED, enabled after setup (DHCP needs open net)
-#   - cicustom overrides Proxmox user-data, so user/SSH/password in YAML
-#   - No in-VM iptables (conflicts with Docker's iptables chains)
-#   - Z.AI API key in auth-profiles.json (NOT config or docker-compose env)
-#   - Model as string "zai/glm-5.1" in config
-#   - Docker install fallback via SSH if cloud-init errors
-#   - Preserves MAC address when enabling firewall on NIC
+# Includes: Z.AI GLM provider, Telegram, Whisper voice transcription,
+#   Home Assistant + Grafana firewall whitelist, hardened tool config
+#
+# Usage:
+#   ./niklas_setup-openclaw-vm.sh \
+#       --zai-api-key "KEY" --ssh-pubkey ~/.ssh/id_ed25519.pub
+#
+# Optional:
+#       --vm-id 100  --vm-ip 192.168.178.80  --gateway 192.168.178.1
+#       --ram 4096   --disk 256  --bridge vmbr0  --user claw
+#       --telegram-token "TOKEN"  --ha-token "TOKEN"  --password "PASS"
+#
+# Prerequisites: Proxmox VE 8.x+, jq, SSH key pair
 ###############################################################################
+
 set -euo pipefail
 
-# ── Colors ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-BOLD='\033[1m'; NC='\033[0m'
-info()  { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
-ok()    { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
-warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
-fail()  { printf "${RED}[FAIL]${NC} %s\n" "$*"; exit 1; }
+# ─── Defaults ────────────────────────────────────────────────────────────────
 
-# ── Defaults ────────────────────────────────────────────────────────────────
-ZAI_API_KEY=""
-VM_USER="claw"
-SSH_PUBKEY=""
-LAN_SUBNET="192.168.178.0/24"
-GATEWAY_IP="192.168.178.1"
-DNS_SERVER=""
-VM_ID=""
-VM_NAME="openclaw"
-VM_BRIDGE="vmbr0"
-VM_RAM=4096
-VM_CORES=2
-VM_DISK=256
-STORAGE="local-lvm"
-TIMEZONE="Europe/Berlin"
-STATIC_IP=""
+VM_ID=100
+VM_IP="192.168.178.80"
+GATEWAY="192.168.178.1"
+RAM=4096
+DISK=256
+BRIDGE="vmbr0"
+USER="claw"
+PASSWORD=""
+ZAI_KEY=""
+SSH_PUBKEY_FILE=""
+TELEGRAM_TOKEN=""
+HA_TOKEN=""
+HA_URL="http://192.168.178.88:8123"
+GRAFANA_URL="https://192.168.178.98/proxy/grafana"
 
-# ── Usage ───────────────────────────────────────────────────────────────────
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") --zai-api-key KEY [OPTIONS]
+HA_IP="192.168.178.88"
+HA_PORT="8123"
+GRAFANA_IP="192.168.178.98"
+GRAFANA_PORT="443"
 
-Creates a hardened Debian 12 VM on Proxmox with Docker + OpenClaw.
+CLOUD_IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+CLOUD_IMG_PATH="/var/lib/vz/template/iso/debian-12-generic-amd64.qcow2"
 
-Required:
-  --zai-api-key KEY      Z.AI API key
+# ─── Colors ──────────────────────────────────────────────────────────────────
 
-Optional:
-  --vm-user NAME         VM user name              (default: claw)
-  --ssh-pubkey FILE      SSH public key file        (default: auto-detect)
-  --lan-subnet CIDR      LAN subnet to block        (default: 192.168.178.0/24)
-  --gateway-ip IP        Gateway / router IP        (default: 192.168.178.1)
-  --dns-server IP        DNS server IP              (default: same as gateway)
-  --vm-id ID             Proxmox VM ID              (default: auto-detect)
-  --vm-name NAME         VM name                    (default: openclaw)
-  --vm-bridge BRIDGE     Network bridge             (default: vmbr0)
-  --vm-ram MB            RAM in MB                  (default: 4096)
-  --vm-cores N           CPU cores                  (default: 2)
-  --vm-disk GB           Disk size in GB            (default: 256)
-  --storage NAME         Proxmox storage            (default: local-lvm)
-  --static-ip IP/CIDR    Static IP for VM           (default: DHCP)
-  --timezone TZ          Timezone                   (default: Europe/Berlin)
-  --help                 Show this help
-EOF
-  exit 0
-}
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; NC='\033[0m'
 
-# ── Parse arguments ─────────────────────────────────────────────────────────
+info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[ OK ]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+
+# ─── Parse arguments ────────────────────────────────────────────────────────
+
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --zai-api-key)   ZAI_API_KEY="$2";   shift 2 ;;
-    --vm-user)       VM_USER="$2";       shift 2 ;;
-    --ssh-pubkey)    SSH_PUBKEY="$2";    shift 2 ;;
-    --lan-subnet)    LAN_SUBNET="$2";    shift 2 ;;
-    --gateway-ip)    GATEWAY_IP="$2";    shift 2 ;;
-    --dns-server)    DNS_SERVER="$2";    shift 2 ;;
-    --vm-id)         VM_ID="$2";         shift 2 ;;
-    --vm-name)       VM_NAME="$2";       shift 2 ;;
-    --vm-bridge)     VM_BRIDGE="$2";     shift 2 ;;
-    --vm-ram)        VM_RAM="$2";        shift 2 ;;
-    --vm-cores)      VM_CORES="$2";      shift 2 ;;
-    --vm-disk)       VM_DISK="$2";       shift 2 ;;
-    --storage)       STORAGE="$2";       shift 2 ;;
-    --static-ip)     STATIC_IP="$2";     shift 2 ;;
-    --timezone)      TIMEZONE="$2";      shift 2 ;;
-    --help)          usage ;;
-    *) fail "Unknown option: $1 (use --help)" ;;
-  esac
+    case "$1" in
+        --vm-id)          VM_ID="$2";          shift 2 ;;
+        --vm-ip)          VM_IP="$2";          shift 2 ;;
+        --gateway)        GATEWAY="$2";        shift 2 ;;
+        --ram)            RAM="$2";            shift 2 ;;
+        --disk)           DISK="$2";           shift 2 ;;
+        --bridge)         BRIDGE="$2";         shift 2 ;;
+        --user)           USER="$2";           shift 2 ;;
+        --password)       PASSWORD="$2";       shift 2 ;;
+        --zai-api-key)    ZAI_KEY="$2";        shift 2 ;;
+        --ssh-pubkey)     SSH_PUBKEY_FILE="$2"; shift 2 ;;
+        --telegram-token) TELEGRAM_TOKEN="$2"; shift 2 ;;
+        --ha-token)       HA_TOKEN="$2";       shift 2 ;;
+        *)                fail "Unknown argument: $1" ;;
+    esac
 done
 
-# ── Validation ──────────────────────────────────────────────────────────────
-[[ -z "$ZAI_API_KEY" ]] && fail "--zai-api-key is required"
-DNS_SERVER="${DNS_SERVER:-$GATEWAY_IP}"
-[[ "$(id -u)" -eq 0 ]] || fail "Must run as root on the Proxmox host"
+# ─── Validate ────────────────────────────────────────────────────────────────
 
-for cmd in qm pvesh wget ssh jq; do
-  command -v "$cmd" &>/dev/null || fail "Required command not found: $cmd"
-done
-ok "Pre-flight checks passed"
+[[ -z "$ZAI_KEY" ]] && fail "Missing --zai-api-key"
+[[ -z "$SSH_PUBKEY_FILE" ]] && fail "Missing --ssh-pubkey"
+[[ ! -f "$SSH_PUBKEY_FILE" ]] && fail "SSH pubkey not found: $SSH_PUBKEY_FILE"
+command -v jq &>/dev/null || fail "jq not installed. Run: apt install -y jq"
+command -v qm &>/dev/null || fail "Must run on a Proxmox host"
 
-# Auto-detect SSH public key
-if [[ -z "$SSH_PUBKEY" ]]; then
-  for candidate in /root/.ssh/id_ed25519.pub /root/.ssh/id_rsa.pub; do
-    [[ -f "$candidate" ]] && SSH_PUBKEY="$candidate" && break
-  done
-  [[ -z "$SSH_PUBKEY" ]] && fail "No SSH key found. Provide --ssh-pubkey or run: ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519"
-fi
-[[ -f "$SSH_PUBKEY" ]] || fail "SSH public key not found: $SSH_PUBKEY"
-SSH_PUBKEY_CONTENT=$(cat "$SSH_PUBKEY")
-ok "SSH public key: $SSH_PUBKEY"
+[[ -z "$PASSWORD" ]] && PASSWORD=$(openssl rand -base64 12)
 
-# Auto-detect VM ID
-if [[ -z "$VM_ID" ]]; then
-  VM_ID=$(pvesh get /cluster/nextid 2>/dev/null | tr -d '"') || fail "Could not detect next VM ID"
-fi
-ok "VM ID: $VM_ID"
+ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$VM_IP" 2>/dev/null || true
 
-# Generate secrets
+SSH_CMD="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes"
+
 GATEWAY_TOKEN=$(openssl rand -hex 32)
-CONSOLE_PASSWORD=$(openssl rand -base64 12)
 
-# IP config for cloud-init
-if [[ -n "$STATIC_IP" ]]; then
-  IP_CONFIG="ip=${STATIC_IP},gw=${GATEWAY_IP}"
-  VM_EXPECTED_IP="${STATIC_IP%%/*}"
-else
-  IP_CONFIG="ip=dhcp"
-  VM_EXPECTED_IP=""
-fi
+info "═══════════════════════════════════════════════════"
+info "  OpenClaw VM Setup — Fire & Forget"
+info "═══════════════════════════════════════════════════"
+info "  VM ID:     $VM_ID"
+info "  VM IP:     $VM_IP"
+info "  RAM:       ${RAM}MB  Disk: ${DISK}GB"
+info "  User:      $USER  Password: $PASSWORD"
+info "  CPU:       x86-64-v2-AES"
+info "  Z.AI:      ${ZAI_KEY:0:8}..."
+info "  Telegram:  ${TELEGRAM_TOKEN:+configured}${TELEGRAM_TOKEN:-(not set)}"
+info "  HA Token:  ${HA_TOKEN:+configured}${HA_TOKEN:-(not set)}"
+info "  GW Token:  ${GATEWAY_TOKEN:0:16}..."
+info "═══════════════════════════════════════════════════"
 
 ###############################################################################
-# Step 1: Download Debian 12 cloud image (generic, not genericcloud)
+# Step 1/8: Download Debian cloud image
 ###############################################################################
-CLOUD_IMG_DIR="/var/lib/vz/template/cache"
-CLOUD_IMG_NAME="debian-12-generic-amd64.qcow2"
-CLOUD_IMG_PATH="${CLOUD_IMG_DIR}/${CLOUD_IMG_NAME}"
-CLOUD_IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/${CLOUD_IMG_NAME}"
 
-mkdir -p "$CLOUD_IMG_DIR"
+info "Step 1/8: Downloading Debian 12 cloud image..."
 if [[ -f "$CLOUD_IMG_PATH" ]]; then
-  ok "Debian 12 cloud image already cached"
+    ok "Cloud image already cached"
 else
-  info "Downloading Debian 12 cloud image (generic variant for Proxmox)..."
-  wget -q --show-progress -O "$CLOUD_IMG_PATH" "$CLOUD_IMG_URL" \
-    || fail "Failed to download cloud image"
-  ok "Downloaded Debian 12 cloud image"
+    wget -q --show-progress -O "$CLOUD_IMG_PATH" "$CLOUD_IMG_URL"
+    ok "Cloud image downloaded"
 fi
 
 ###############################################################################
-# Step 2: Create VM (firewall=0 initially — enabled after setup)
+# Step 2/8: Create VM
 ###############################################################################
-info "Creating VM ${VM_ID} (${VM_NAME})..."
+
+info "Step 2/8: Creating VM $VM_ID..."
+
+if qm status "$VM_ID" &>/dev/null; then
+    warn "VM $VM_ID exists — destroying"
+    qm stop "$VM_ID" --skiplock 2>/dev/null || true
+    sleep 3
+    qm destroy "$VM_ID" --purge 2>/dev/null || true
+    sleep 2
+fi
+
 qm create "$VM_ID" \
-  --name "$VM_NAME" \
-  --ostype l26 \
-  --machine q35 \
-  --cpu host \
-  --cores "$VM_CORES" \
-  --memory "$VM_RAM" \
-  --net0 "virtio,bridge=${VM_BRIDGE},firewall=0" \
-  --scsihw virtio-scsi-single \
-  --serial0 socket \
-  --vga std \
-  --agent enabled=1 \
-  --onboot 1 \
-  --protection 0 \
-  || fail "Failed to create VM"
-ok "VM $VM_ID created"
+    --name "openclaw" \
+    --ostype l26 \
+    --cores 2 \
+    --memory "$RAM" \
+    --cpu cputype=x86-64-v2-AES \
+    --net0 "virtio,bridge=${BRIDGE},firewall=0" \
+    --scsihw virtio-scsi-single \
+    --vga std \
+    --agent enabled=1 \
+    --onboot 1
 
-###############################################################################
-# Step 3: Import disk & resize
-###############################################################################
-info "Importing cloud image as boot disk..."
-qm set "$VM_ID" --scsi0 "${STORAGE}:0,import-from=${CLOUD_IMG_PATH},iothread=1,discard=on" \
-  || fail "Failed to import disk"
-ok "Disk imported"
-
-info "Resizing disk to ${VM_DISK}G..."
-qm disk resize "$VM_ID" scsi0 "${VM_DISK}G" || fail "Failed to resize disk"
-ok "Disk resized to ${VM_DISK}G"
-
+qm importdisk "$VM_ID" "$CLOUD_IMG_PATH" local-lvm --format raw >/dev/null
+qm set "$VM_ID" --scsi0 "local-lvm:vm-${VM_ID}-disk-0,discard=on,ssd=1"
 qm set "$VM_ID" --boot order=scsi0
-ok "Boot order set"
+qm resize "$VM_ID" scsi0 "${DISK}G"
+qm set "$VM_ID" --ide2 "local-lvm:cloudinit"
+
+ok "VM $VM_ID created (${DISK}GB disk, x86-64-v2-AES CPU)"
 
 ###############################################################################
-# Step 4: Cloud-init config
+# Step 3/8: Proxmox-native cloud-init (NO cicustom!)
 ###############################################################################
-info "Configuring cloud-init..."
-qm set "$VM_ID" --ide2 "${STORAGE}:cloudinit"
-# Note: ciuser/cipassword/sshkeys are set here for Proxmox UI display,
-# but cicustom overrides them — the actual user setup is in our YAML.
-qm set "$VM_ID" --ciuser "$VM_USER"
-qm set "$VM_ID" --cipassword "$CONSOLE_PASSWORD"
-qm set "$VM_ID" --sshkeys "$SSH_PUBKEY"
-qm set "$VM_ID" --ipconfig0 "$IP_CONFIG"
-qm set "$VM_ID" --ciupgrade 1
-ok "Cloud-init configured (user=$VM_USER, ${IP_CONFIG})"
 
-###############################################################################
-# Step 5: Write cloud-init user-data
-# cicustom OVERRIDES Proxmox auto-generated user-data, so we must include
-# everything: user creation, SSH key, password, packages, and runcmd.
-###############################################################################
-SNIPPETS_DIR="/var/lib/vz/snippets"
-USERDATA_FILE="${SNIPPETS_DIR}/openclaw-${VM_ID}-userdata.yml"
-mkdir -p "$SNIPPETS_DIR"
+info "Step 3/8: Configuring cloud-init (native Proxmox)..."
 
-info "Writing cloud-init user-data..."
-cat > "$USERDATA_FILE" <<USERDATA_EOF
-#cloud-config
+qm set "$VM_ID" \
+    --ciuser "$USER" \
+    --cipassword "$PASSWORD" \
+    --sshkeys "$SSH_PUBKEY_FILE" \
+    --ipconfig0 "ip=${VM_IP}/24,gw=${GATEWAY}" \
+    --nameserver "$GATEWAY" \
+    --searchdomain "local"
 
-# User creation — required because cicustom overrides Proxmox defaults
-users:
-  - name: ${VM_USER}
-    groups: sudo, docker
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    lock_passwd: false
-    ssh_authorized_keys:
-      - ${SSH_PUBKEY_CONTENT}
-
-chpasswd:
-  list: |
-    ${VM_USER}:${CONSOLE_PASSWORD}
-  expire: false
-
-package_update: true
-package_upgrade: true
-packages:
-  - qemu-guest-agent
-  - ca-certificates
-  - curl
-  - gnupg
-  - jq
-  - unattended-upgrades
-  - apt-listchanges
-
-timezone: ${TIMEZONE}
-
-write_files:
-  # Disable IPv6 (prevents bypass of IPv4-only firewall rules)
-  - path: /etc/sysctl.d/99-disable-ipv6.conf
-    content: |
-      net.ipv6.conf.all.disable_ipv6 = 1
-      net.ipv6.conf.default.disable_ipv6 = 1
-      net.ipv6.conf.lo.disable_ipv6 = 1
-    owner: root:root
-    permissions: "0644"
-
-  # NOTE: No in-VM iptables — Docker manages its own iptables chains.
-  # LAN isolation is enforced by the Proxmox firewall (host-level).
-
-  # Docker compose file for OpenClaw
-  - path: /home/${VM_USER}/openclaw/docker-compose.yml
-    content: |
-      services:
-        openclaw-gateway:
-          image: ghcr.io/openclaw/openclaw:latest
-          container_name: openclaw-gateway
-          restart: unless-stopped
-          ports:
-            - "127.0.0.1:18789:18789"
-          cap_drop:
-            - NET_RAW
-            - NET_ADMIN
-            - SYS_ADMIN
-          security_opt:
-            - no-new-privileges
-          volumes:
-            - /home/${VM_USER}/.openclaw:/home/node/.openclaw
-            - /home/${VM_USER}/openclaw/workspace:/workspace
-          command: >
-            node openclaw.mjs gateway
-            --allow-unconfigured
-            --bind lan
-            --port 18789
-          healthcheck:
-            test: ["CMD", "curl", "-sf", "http://127.0.0.1:18789/healthz"]
-            interval: 30s
-            timeout: 10s
-            retries: 3
-            start_period: 15s
-          environment:
-            HOME: /home/node
-            TERM: xterm-256color
-    owner: ${VM_USER}:${VM_USER}
-    permissions: "0600"
-
-  # Unattended security upgrades
-  - path: /etc/apt/apt.conf.d/20auto-upgrades
-    content: |
-      APT::Periodic::Update-Package-Lists "1";
-      APT::Periodic::Unattended-Upgrade "1";
-      APT::Periodic::AutocleanInterval "7";
-    owner: root:root
-    permissions: "0644"
-
-runcmd:
-  # Apply sysctl (disable IPv6)
-  - sysctl --system
-
-  # Install Docker CE
-  - install -m 0755 -d /etc/apt/keyrings
-  - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
-  - chmod a+r /etc/apt/keyrings/docker.asc
-  - echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \$(. /etc/os-release && echo \$VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
-  - apt-get update -y
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-  # Create OpenClaw directories
-  - mkdir -p /home/${VM_USER}/.openclaw/agents/main/agent
-  - mkdir -p /home/${VM_USER}/openclaw/workspace
-  - chown -R ${VM_USER}:${VM_USER} /home/${VM_USER}/.openclaw
-  - chown -R ${VM_USER}:${VM_USER} /home/${VM_USER}/openclaw
-  - chmod 700 /home/${VM_USER}/.openclaw
-
-  # Enable and start qemu-guest-agent
-  - systemctl enable qemu-guest-agent
-  - systemctl start qemu-guest-agent
-
-  # Pull OpenClaw image and start container
-  - docker pull ghcr.io/openclaw/openclaw:latest
-  - cd /home/${VM_USER}/openclaw && docker compose up -d
-USERDATA_EOF
-
-ok "Cloud-init user-data written to $USERDATA_FILE"
+ok "Cloud-init: user=$USER, IP=$VM_IP, SSH key + password auth"
 
 ###############################################################################
-# Step 6: Attach cicustom
+# Step 4/8: Proxmox firewall (disabled until setup completes)
 ###############################################################################
-info "Attaching custom cloud-init user-data..."
-qm set "$VM_ID" --cicustom "user=local:snippets/openclaw-${VM_ID}-userdata.yml"
-ok "cicustom attached"
 
-###############################################################################
-# Step 7: Write Proxmox firewall rules (DISABLED until setup completes)
-###############################################################################
-FW_DIR="/etc/pve/firewall"
-FW_FILE="${FW_DIR}/${VM_ID}.fw"
-mkdir -p "$FW_DIR"
+info "Step 4/8: Preparing Proxmox firewall (disabled until setup completes)..."
 
-info "Writing Proxmox firewall rules (disabled until setup completes)..."
-cat > "$FW_FILE" <<EOF
+CLUSTER_FW="/etc/pve/firewall/cluster.fw"
+if ! grep -q "^enable: 1" "$CLUSTER_FW" 2>/dev/null; then
+    cat > "$CLUSTER_FW" << 'EOF'
+[OPTIONS]
+enable: 1
+policy_in: ACCEPT
+policy_out: ACCEPT
+EOF
+fi
+
+cat > "/etc/pve/firewall/${VM_ID}.fw" << EOF
 [OPTIONS]
 enable: 0
 dhcp: 1
@@ -356,338 +195,425 @@ policy_in: DROP
 policy_out: DROP
 
 [RULES]
-# Outbound: allow gateway (for internet routing + DNS)
-OUT ACCEPT -d ${GATEWAY_IP}/32 -log nolog
-OUT ACCEPT -d ${DNS_SERVER}/32 -p udp -dport 53 -log nolog
-OUT ACCEPT -d ${DNS_SERVER}/32 -p tcp -dport 53 -log nolog
-
-# Outbound: block all RFC1918 (LAN isolation)
+OUT ACCEPT -d ${GATEWAY}/32 -log nolog
+OUT ACCEPT -d ${GATEWAY}/32 -p udp -dport 53 -log nolog
+OUT ACCEPT -d ${GATEWAY}/32 -p tcp -dport 53 -log nolog
+OUT ACCEPT -dest ${HA_IP} -dport ${HA_PORT} -p tcp -log nolog
+OUT ACCEPT -dest ${GRAFANA_IP} -dport ${GRAFANA_PORT} -p tcp -log nolog
 OUT DROP -d 10.0.0.0/8 -log nolog
 OUT DROP -d 172.16.0.0/12 -log nolog
 OUT DROP -d 192.168.0.0/16 -log nolog
 OUT DROP -d 169.254.0.0/16 -log nolog
-
-# Outbound: allow internet
 OUT ACCEPT -log nolog
-
-# Inbound: SSH from LAN only
-IN ACCEPT -source ${LAN_SUBNET} -p tcp -dport 22 -log nolog
-
-# Inbound: ICMP
+IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 22 -log nolog
 IN ACCEPT -p icmp -log nolog
 EOF
-ok "Firewall rules written (disabled)"
+
+ok "Firewall rules written (DISABLED until setup completes)"
 
 ###############################################################################
-# Step 8: Start VM
+# Step 5/8: Start VM (with Docker-on-host detection)
 ###############################################################################
-info "Starting VM ${VM_ID}..."
-qm start "$VM_ID" || fail "Failed to start VM"
+
+info "Step 5/8: Starting VM..."
+
+# Detect + remove Docker from Proxmox host (blocks all VM traffic!)
+if iptables -L DOCKER-USER -n &>/dev/null; then
+    warn "Docker detected on Proxmox host — this blocks ALL VM network traffic!"
+    warn "Removing Docker from Proxmox host..."
+    systemctl stop docker docker.socket containerd 2>/dev/null || true
+    systemctl disable docker docker.socket containerd 2>/dev/null || true
+    apt purge -y docker-ce docker-ce-cli docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras containerd.io 2>/dev/null || true
+    apt autoremove -y 2>/dev/null || true
+    iptables -P FORWARD ACCEPT
+    iptables -F FORWARD 2>/dev/null || true
+    pve-firewall restart
+    ok "Docker removed from Proxmox host, firewall restored"
+fi
+
+qm start "$VM_ID"
 ok "VM $VM_ID started"
 
 ###############################################################################
-# Step 9: Wait for VM IP
+# Step 6/8: Wait for boot (handle first-boot kernel panic)
 ###############################################################################
-info "Waiting for VM IP address..."
-VM_IP=""
-MAX_WAIT=300
-ELAPSED=0
 
-while [[ $ELAPSED -lt $MAX_WAIT ]]; do
-  sleep 5
-  ELAPSED=$((ELAPSED + 5))
+info "Step 6/8: Waiting for VM to boot..."
+info "  (First boot may kernel panic — auto-recovery enabled)"
 
-  VM_IP=$(qm guest cmd "$VM_ID" network-get-interfaces 2>/dev/null \
-    | jq -r '[.[] | select(.name != "lo" and .name != "docker0" and (.name | startswith("br-") | not) and (.name | startswith("veth") | not)) | .["ip-addresses"][]? | select(.["ip-address-type"] == "ipv4")] | first | .["ip-address"] // empty' 2>/dev/null || true)
+sleep 30
 
-  if [[ -n "$VM_IP" && "$VM_IP" != "null" ]]; then
-    break
-  fi
-  VM_IP=""
-  printf "."
-done
-
-# Fallback: ip neigh
-if [[ -z "$VM_IP" ]]; then
-  warn "Guest agent did not return IP, trying ip neigh..."
-  VM_MAC=$(qm config "$VM_ID" | grep -oP 'virtio=\K[0-9A-Fa-f:]+' | head -1)
-  if [[ -n "$VM_MAC" ]]; then
-    for _ in $(seq 1 24); do
-      sleep 5; ELAPSED=$((ELAPSED + 5))
-      VM_IP=$(ip neigh show | grep -i "$VM_MAC" | awk '{print $1}' | head -1 || true)
-      [[ -n "$VM_IP" ]] && break
-      printf "."
-    done
-  fi
+VM_STATUS=$(qm status "$VM_ID" 2>/dev/null | awk '{print $2}')
+if [[ "$VM_STATUS" == "stopped" ]]; then
+    warn "First-boot kernel panic detected — restarting VM..."
+    qm start "$VM_ID"
+    sleep 30
 fi
 
-echo ""
-[[ -z "$VM_IP" ]] && fail "Could not detect VM IP after ${ELAPSED}s. Check VM console."
-ok "VM IP: $VM_IP"
+ELAPSED=0
+RESET_DONE=false
+while [[ $ELAPSED -lt 240 ]]; do
+    if $SSH_CMD "${USER}@${VM_IP}" "echo SSH_OK" 2>/dev/null | grep -q "SSH_OK"; then
+        ok "SSH is ready"
+        break
+    fi
 
-###############################################################################
-# Step 10: Wait for SSH
-###############################################################################
-info "Waiting for SSH on ${VM_IP}..."
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-SSH_CMD="ssh ${SSH_OPTS} ${VM_USER}@${VM_IP}"
-SSH_READY=false
+    if [[ $ELAPSED -ge 90 ]] && [[ "$RESET_DONE" == "false" ]]; then
+        VM_STATUS=$(qm status "$VM_ID" 2>/dev/null | awk '{print $2}')
+        if [[ "$VM_STATUS" == "stopped" ]]; then
+            warn "VM stopped — doing clean start..."
+            qm start "$VM_ID"
+            RESET_DONE=true
+            sleep 30
+        elif ! ping -c 1 -W 2 "$VM_IP" &>/dev/null; then
+            warn "VM not responding — doing clean stop + start..."
+            qm stop "$VM_ID" --timeout 10 2>/dev/null || qm reset "$VM_ID"
+            sleep 5
+            qm start "$VM_ID"
+            RESET_DONE=true
+            sleep 30
+        fi
+    fi
 
-for _ in $(seq 1 60); do
-  if $SSH_CMD "true" 2>/dev/null; then
-    SSH_READY=true; break
-  fi
-  sleep 5
+    sleep 10
+    ELAPSED=$((ELAPSED + 10))
+    printf "."
 done
-$SSH_READY || fail "SSH not available after 5 minutes"
-ok "SSH connection established"
+echo ""
+
+if ! $SSH_CMD "${USER}@${VM_IP}" "echo FINAL_OK" 2>/dev/null | grep -q "FINAL_OK"; then
+    fail "Cannot reach VM via SSH after 240s. Check Proxmox Console."
+fi
+
+# Wait for cloud-init to fully complete
+info "  Waiting for cloud-init to finish (apt updates, 3-8 minutes)..."
+ELAPSED=0
+while [[ $ELAPSED -lt 600 ]]; do
+    CI_STATUS=$($SSH_CMD "${USER}@${VM_IP}" "cloud-init status 2>/dev/null | head -1" 2>/dev/null || echo "unknown")
+    if echo "$CI_STATUS" | grep -q "done"; then
+        ok "Cloud-init completed"
+        break
+    fi
+    sleep 15
+    ELAPSED=$((ELAPSED + 15))
+    printf "."
+done
+echo ""
+
+if [[ $ELAPSED -ge 600 ]]; then
+    warn "Cloud-init still running after 10min — proceeding anyway"
+fi
 
 ###############################################################################
-# Step 11: Wait for cloud-init
+# Step 7/8: Phase 2 — Install Docker + OpenClaw via SSH
 ###############################################################################
-info "Waiting for cloud-init to finish (this may take several minutes)..."
-$SSH_CMD "sudo cloud-init status --wait" 2>/dev/null || true
-CI_STATUS=$($SSH_CMD "sudo cloud-init status 2>/dev/null | head -1" 2>/dev/null || echo "unknown")
-info "Cloud-init status: $CI_STATUS"
 
-###############################################################################
-# Step 12: Ensure Docker is installed (fallback if cloud-init errored)
-###############################################################################
-info "Checking Docker status..."
-DOCKER_OK=$($SSH_CMD "command -v docker &>/dev/null && docker info &>/dev/null && echo OK || echo FAIL" 2>/dev/null || echo "FAIL")
+info "Step 7/8: Installing Docker + OpenClaw via SSH..."
 
-if [[ "$DOCKER_OK" != "OK" ]]; then
-  warn "Docker not ready — installing via SSH fallback..."
-  $SSH_CMD bash <<DOCKER_INSTALL
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
+# --- 7a: Install Docker ---
+info "  [1/7] Installing Docker..."
+$SSH_CMD "${USER}@${VM_IP}" << 'DOCKER_INSTALL'
+set -e
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \$(. /etc/os-release && echo \$VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-sudo apt-get update -y
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker ${VM_USER}
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt-get update -qq
+sudo apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin qemu-guest-agent jq curl
+sudo systemctl enable --now docker
+sudo systemctl enable --now qemu-guest-agent
+sudo usermod -aG docker $USER
+echo "DOCKER_OK"
 DOCKER_INSTALL
-  ok "Docker installed via SSH fallback"
-else
-  ok "Docker is running"
-fi
+ok "  Docker installed"
 
-###############################################################################
-# Step 13: Write OpenClaw config + auth + start container
-###############################################################################
-info "Writing hardened OpenClaw configuration..."
-$SSH_CMD bash <<CONFIG_SCRIPT
-set -euo pipefail
+# --- 7b: Create directories ---
+info "  [2/7] Creating directories..."
+$SSH_CMD "${USER}@${VM_IP}" "mkdir -p ~/openclaw/workspace ~/.openclaw/agents/main/agent ~/.openclaw/bin ~/.openclaw/workspace/skills"
+ok "  Directories created"
 
-# Create directories
-mkdir -p ~/.openclaw/agents/main/agent
-mkdir -p ~/openclaw/workspace
+# --- 7c: Write docker-compose.yml ---
+info "  [3/7] Writing docker-compose.yml..."
+$SSH_CMD "${USER}@${VM_IP}" "cat > ~/openclaw/docker-compose.yml" << 'COMPOSE_EOF'
+services:
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_ADMIN
+    security_opt:
+      - no-new-privileges
+    volumes:
+      - /home/claw/.openclaw:/home/node/.openclaw
+      - /home/claw/openclaw/workspace:/workspace
+    command: >
+      node openclaw.mjs gateway
+      --allow-unconfigured
+      --bind loopback
+      --port 18789
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:18789/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+    env_file:
+      - /home/claw/.openclaw/.credentials.env
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: openclaw-whisper
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - WHISPER__MODEL=small
+      - WHISPER__INFERENCE_DEVICE=cpu
+      - UVICORN_HOST=127.0.0.1
+      - UVICORN_PORT=8000
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+COMPOSE_EOF
+ok "  docker-compose.yml written"
 
-# Write hardened openclaw.json — model as string, API key in auth-profiles
-cat > ~/.openclaw/openclaw.json << 'OCJSON'
+# --- 7d: Write .credentials.env ---
+info "  [4/7] Writing credentials..."
+$SSH_CMD "${USER}@${VM_IP}" "printf '%s\n' \
+  'HA_URL=${HA_URL}' \
+  'HA_TOKEN=${HA_TOKEN}' \
+  'GRAFANA_URL=${GRAFANA_URL}' \
+  > ~/.openclaw/.credentials.env && chmod 644 ~/.openclaw/.credentials.env"
+ok "  Credentials written"
+
+# --- 7e: Write openclaw.json ---
+info "  [5/7] Writing openclaw.json..."
+$SSH_CMD "${USER}@${VM_IP}" "cat > ~/.openclaw/openclaw.json" << OCJSON_EOF
 {
   "gateway": {
     "mode": "local",
-    "bind": "lan",
+    "bind": "loopback",
     "auth": {
       "mode": "token",
       "token": "${GATEWAY_TOKEN}"
-    }
+    },
+    "port": 18789
   },
   "session": {
     "dmScope": "per-channel-peer"
   },
-  "agents": {
-    "defaults": {
-      "model": "zai/glm-5.1"
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "zai": {
+        "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+        "api": "openai-completions",
+        "models": [
+          {"id": "glm-4.7", "name": "GLM-4.7", "reasoning": true, "input": ["text"], "cost": {"input": 0.6, "output": 2.2, "cacheRead": 0.11, "cacheWrite": 0}, "contextWindow": 204800, "maxTokens": 131072},
+          {"id": "glm-4.7-flash", "name": "GLM-4.7 Flash", "reasoning": true, "input": ["text"], "cost": {"input": 0.07, "output": 0.4, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 200000, "maxTokens": 131072},
+          {"id": "glm-5.1", "name": "GLM-5.1", "reasoning": true, "input": ["text"], "cost": {"input": 1.2, "output": 4, "cacheRead": 0.24, "cacheWrite": 0}, "contextWindow": 202800, "maxTokens": 131100}
+        ]
+      }
     }
   },
   "tools": {
-    "profile": "messaging",
-    "deny": [
-      "group:automation",
-      "group:runtime",
-      "group:fs",
-      "sessions_spawn",
-      "sessions_send"
-    ],
-    "fs": {
-      "workspaceOnly": true
-    },
-    "exec": {
-      "security": "deny",
-      "ask": "always"
-    },
-    "elevated": {
-      "enabled": false
+    "profile": "coding",
+    "deny": ["sessions_spawn", "sessions_send"],
+    "fs": {"workspaceOnly": true},
+    "exec": {"security": "full", "ask": "off"},
+    "elevated": {"enabled": false},
+    "web": {"search": {"provider": "brave"}},
+    "media": {
+      "audio": {
+        "enabled": true,
+        "models": [{
+          "type": "cli",
+          "command": "curl",
+          "args": ["-sf", "-X", "POST", "http://127.0.0.1:8000/v1/audio/transcriptions", "-F", "file=@{{MediaPath}}", "-F", "model=Systran/faster-whisper-small", "-F", "response_format=text", "-F", "language=de"],
+          "timeoutSeconds": 60
+        }]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {"primary": "zai/glm-4.7"},
+      "workspace": "/home/node/.openclaw/workspace"
+    }
+  },
+  "skills": {
+    "install": {"nodeManager": "bun"}
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "boot-md": {"enabled": true},
+        "session-memory": {"enabled": true}
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "groups": {"*": {"requireMention": true}},
+      "botToken": "${TELEGRAM_TOKEN}"
     }
   }
 }
-OCJSON
+OCJSON_EOF
+ok "  openclaw.json written"
 
-# Write Z.AI auth profile (API key goes here, not in config)
-cat > ~/.openclaw/agents/main/agent/auth-profiles.json << 'AUTHJSON'
+# --- 7f: Write auth-profiles.json ---
+info "  [6/7] Writing auth-profiles.json..."
+$SSH_CMD "${USER}@${VM_IP}" "cat > ~/.openclaw/agents/main/agent/auth-profiles.json" << AUTHEOF
 {
-  "zai": {
-    "apiKey": "${ZAI_API_KEY}",
-    "baseUrl": "https://api.z.ai/api/coding/paas/v4"
+  "version": 1,
+  "profiles": {
+    "zai:default": {
+      "type": "api_key",
+      "provider": "zai",
+      "key": "${ZAI_KEY}"
+    }
   }
 }
-AUTHJSON
+AUTHEOF
+ok "  Auth profiles written"
+
+# --- 7g: Write boot.md + Pull + Start ---
+info "  [7/7] Writing boot.md, pulling images, starting containers..."
+$SSH_CMD "${USER}@${VM_IP}" "cat > ~/.openclaw/boot.md" << 'BOOTEOF'
+## Verfuegbare Integrationen
+
+### Home Assistant (Smart Home)
+- URL: $HA_URL (Env-Var im Container verfuegbar)
+- Token: $HA_TOKEN (Env-Var im Container verfuegbar)
+- Nutze curl mit den Env-Vars $HA_URL und $HA_TOKEN
+- jq liegt unter /home/node/.openclaw/bin/jq
+
+### Grafana (Solar-Dashboards)
+- URL: $GRAFANA_URL (Env-Var im Container verfuegbar)
+
+### Wichtig
+- Du HAST Netzwerkzugriff auf 192.168.178.88 (Home Assistant) und 192.168.178.98 (Grafana)
+- Du HAST die Env-Vars HA_URL, HA_TOKEN, GRAFANA_URL im Container
+- Nutze exec Tool mit curl/jq fuer API-Zugriffe
+BOOTEOF
 
 # Set permissions
-chmod 700 ~/.openclaw
-chmod 600 ~/.openclaw/openclaw.json
-chmod 600 ~/.openclaw/agents/main/agent/auth-profiles.json
-chmod 600 ~/openclaw/docker-compose.yml
-CONFIG_SCRIPT
+$SSH_CMD "${USER}@${VM_IP}" "chmod -R 755 ~/.openclaw && chmod 600 ~/.openclaw/agents/main/agent/auth-profiles.json"
 
-ok "Config + auth profiles written"
+# Install jq binary for container
+$SSH_CMD "${USER}@${VM_IP}" "curl -sL -o ~/.openclaw/bin/jq https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 && chmod +x ~/.openclaw/bin/jq"
 
-# Now fix the token and API key (heredoc with 'QUOTES' didn't expand vars)
-$SSH_CMD "sed -i 's|\${GATEWAY_TOKEN}|${GATEWAY_TOKEN}|' ~/.openclaw/openclaw.json"
-$SSH_CMD "sed -i 's|\${ZAI_API_KEY}|${ZAI_API_KEY}|' ~/.openclaw/agents/main/agent/auth-profiles.json"
-ok "Secrets injected"
+# Disable IPv6
+$SSH_CMD "${USER}@${VM_IP}" << 'IPV6OFF'
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+echo "net.ipv6.conf.all.disable_ipv6 = 1" | sudo tee -a /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+echo "net.ipv6.conf.default.disable_ipv6 = 1" | sudo tee -a /etc/sysctl.d/99-disable-ipv6.conf >/dev/null
+IPV6OFF
 
-###############################################################################
-# Step 14: Start/restart OpenClaw container
-###############################################################################
-info "Starting OpenClaw container..."
-$SSH_CMD bash <<'START_SCRIPT'
-set -euo pipefail
+# Pull and start
+$SSH_CMD "${USER}@${VM_IP}" << 'START_OC'
+set -e
 cd ~/openclaw
-# Clean up any stale state
-docker compose down --remove-orphans 2>/dev/null || true
-docker network prune -f 2>/dev/null || true
-# Pull latest image if not cached
-docker pull ghcr.io/openclaw/openclaw:latest 2>&1 | tail -3
-# Start
-docker compose up -d
-START_SCRIPT
-ok "Container started"
+sudo docker compose pull --quiet
+sudo docker compose up -d
+echo "Waiting 20s for containers to start..."
+sleep 20
+sudo docker ps --format "table {{.Names}}\t{{.Status}}"
+echo "OPENCLAW_SETUP_COMPLETE"
+START_OC
+ok "OpenClaw deployed"
 
 ###############################################################################
-# Step 15: Run security audit
+# Step 8/8: Enable firewall + verify
 ###############################################################################
-info "Running openclaw security audit --fix..."
-$SSH_CMD bash <<'AUDIT_SCRIPT'
-cd ~/openclaw
-for i in $(seq 1 30); do
-  docker compose ps --format '{{.State}}' 2>/dev/null | grep -q running && break
-  sleep 2
-done
-docker compose exec -T openclaw-gateway node openclaw.mjs security audit --fix 2>/dev/null || true
-AUDIT_SCRIPT
-ok "Security audit completed"
 
-###############################################################################
-# Step 16: Wait for health check
-###############################################################################
-info "Waiting for OpenClaw health check..."
-HEALTH_OK=false
-for _ in $(seq 1 30); do
-  HEALTH=$($SSH_CMD "curl -sf http://127.0.0.1:18789/healthz 2>/dev/null" || true)
-  if [[ -n "$HEALTH" ]]; then
-    HEALTH_OK=true; break
-  fi
-  sleep 5
-done
-if $HEALTH_OK; then
-  ok "OpenClaw health check passed"
-else
-  warn "Health check timed out — container may still be starting"
-fi
+info "Step 8/8: Enabling firewall + finalizing..."
 
-###############################################################################
-# Step 17: Verify model is correct
-###############################################################################
-MODEL=$($SSH_CMD "curl -sf http://127.0.0.1:18789/healthz 2>/dev/null" | jq -r '.model // empty' 2>/dev/null || true)
-$SSH_CMD bash <<'MODEL_CHECK'
-cd ~/openclaw
-docker compose logs --tail 3 2>/dev/null | grep -o "agent model: [^ ]*" || true
-MODEL_CHECK
+# Enable VM firewall
+sed -i 's/^enable: 0/enable: 1/' "/etc/pve/firewall/${VM_ID}.fw"
+ok "VM firewall enabled"
 
-###############################################################################
-# Step 18: Enable Proxmox firewall (preserving MAC address)
-###############################################################################
-info "Enabling Proxmox firewall..."
-sed -i 's/^enable: 0/enable: 1/' "$FW_FILE"
-# Preserve the MAC address — extract it first, then set firewall=1
+# Enable NIC firewall
 CURRENT_MAC=$(qm config "$VM_ID" | grep -oP 'virtio=\K[0-9A-Fa-f:]+' | head -1)
-qm set "$VM_ID" --net0 "virtio=${CURRENT_MAC},bridge=${VM_BRIDGE},firewall=1" 2>/dev/null || true
-ok "Proxmox firewall enabled (LAN blocked, internet allowed)"
-
-###############################################################################
-# Step 19: Verify firewall didn't break connectivity
-###############################################################################
-info "Verifying connectivity after firewall enable..."
-sleep 3
-SSH_CHECK=$($SSH_CMD "echo OK" 2>/dev/null || echo "FAIL")
-if [[ "$SSH_CHECK" == "OK" ]]; then
-  ok "SSH still works after firewall"
-else
-  warn "SSH failed after firewall — disabling firewall as safety measure"
-  sed -i 's/^enable: 1/enable: 0/' "$FW_FILE"
-  warn "Firewall disabled. Check /etc/pve/firewall/${VM_ID}.fw manually."
+if [[ -n "$CURRENT_MAC" ]]; then
+    qm set "$VM_ID" --net0 "virtio=${CURRENT_MAC},bridge=${BRIDGE},firewall=1"
+    ok "NIC firewall enabled"
 fi
 
-# Verify internet + LAN isolation
-INET=$($SSH_CMD "curl -sf --max-time 5 https://cloud.debian.org >/dev/null && echo OK || echo FAIL" 2>/dev/null || echo "SKIP")
-LAN=$($SSH_CMD "curl -sf --max-time 3 http://${GATEWAY_IP}:8123 2>/dev/null && echo EXPOSED || echo BLOCKED" 2>/dev/null || echo "BLOCKED")
+# Health check
+info "Waiting for health check..."
+ELAPSED=0
+while [[ $ELAPSED -lt 60 ]]; do
+    if $SSH_CMD "${USER}@${VM_IP}" "curl -sf http://127.0.0.1:18789/healthz" 2>/dev/null; then
+        echo ""
+        ok "OpenClaw is healthy!"
+        break
+    fi
+    sleep 10
+    ELAPSED=$((ELAPSED + 10))
+done
 
+# Install HA skill
+info "Installing Home Assistant skill..."
+$SSH_CMD "${USER}@${VM_IP}" "cd ~/openclaw && sudo docker compose exec -T openclaw-gateway node openclaw.mjs skills install home-assistant 2>/dev/null || echo 'HA skill install skipped (rate limit or not available)'"
+
+# Verify connectivity
+INET=$($SSH_CMD "${USER}@${VM_IP}" "curl -sf --max-time 5 https://cloud.debian.org >/dev/null && echo OK || echo FAIL" 2>/dev/null || echo "SKIP")
 [[ "$INET" == "OK" ]] && ok "Internet: accessible" || warn "Internet: $INET"
-[[ "$LAN" == "BLOCKED" ]] && ok "LAN: blocked (isolated from Home Assistant)" || warn "LAN: $LAN"
 
 ###############################################################################
-# Step 20: Print connection info
+# Summary
 ###############################################################################
+
 echo ""
-echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  OpenClaw VM Setup Complete${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  ✅ OpenClaw VM Setup Complete!${NC}"
+echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "${BOLD}VM Details:${NC}"
-echo -e "  VM ID:      ${VM_ID}"
-echo -e "  VM Name:    ${VM_NAME}"
-echo -e "  VM IP:      ${VM_IP}"
-echo -e "  VM User:    ${VM_USER}"
+echo "  VM ID:          $VM_ID"
+echo "  VM IP:          $VM_IP"
+echo "  User:           $USER"
+echo "  Password:       $PASSWORD"
+echo "  Disk:           ${DISK}GB"
+echo "  SSH:            ssh ${USER}@${VM_IP}"
 echo ""
-echo -e "${BOLD}SSH Access (from Proxmox host):${NC}"
-echo -e "  ssh ${VM_USER}@${VM_IP}"
+echo "  Gateway:        http://127.0.0.1:18789 (via SSH tunnel)"
+echo "  Gateway Token:  $GATEWAY_TOKEN"
+echo "  Whisper:        http://127.0.0.1:8000 (local)"
 echo ""
-echo -e "${BOLD}Console Access (Proxmox web UI → VM ${VM_ID} → Console):${NC}"
-echo -e "  User:     ${VM_USER}"
-echo -e "  Password: ${YELLOW}${CONSOLE_PASSWORD}${NC}"
+echo "  SSH Tunnel (from Windows):"
+echo "    ssh -i C:\\Users\\bvogel\\.ssh\\id_ed25519_openclaw \\"
+echo "        -L 18789:localhost:18789 ${USER}@${VM_IP}"
 echo ""
-echo -e "${BOLD}Dashboard (via SSH tunnel from your workstation):${NC}"
-echo -e "  1. Copy the SSH key to your workstation:"
-echo -e "     ${BLUE}scp root@$(hostname -I | awk '{print $1}'):/root/.ssh/id_ed25519 ~/.ssh/id_ed25519_openclaw${NC}"
-echo -e "  2. Start SSH tunnel:"
-echo -e "     ${BLUE}ssh -i ~/.ssh/id_ed25519_openclaw -L 18789:localhost:18789 ${VM_USER}@${VM_IP}${NC}"
-echo -e "  3. Open in browser: ${BLUE}http://localhost:18789${NC}"
-echo ""
-echo -e "${BOLD}Gateway Auth Token:${NC}"
-echo -e "  ${YELLOW}${GATEWAY_TOKEN}${NC}"
-echo ""
-echo -e "${BOLD}Z.AI Model:${NC}"
-echo -e "  Provider: zai | Model: glm-5.1"
-echo -e "  Endpoint: https://api.z.ai/api/coding/paas/v4"
-echo ""
-echo -e "${BOLD}Security:${NC}"
-echo -e "  ✓ Full VM isolation (Proxmox hypervisor)"
-echo -e "  ✓ Proxmox firewall: LAN blocked, RFC1918 blocked, internet allowed"
-echo -e "  ✓ IPv6 disabled"
-echo -e "  ✓ Docker: cap_drop NET_RAW, NET_ADMIN, SYS_ADMIN + no-new-privileges"
-echo -e "  ✓ Port 18789 bound to VM loopback only (127.0.0.1)"
-echo -e "  ✓ Hardened tool config (deny automation/runtime/fs)"
-echo -e "  ✓ Unattended security upgrades enabled"
-echo -e "  ✓ Security audit --fix executed"
-echo ""
-if [[ -z "$STATIC_IP" ]]; then
-  echo -e "${YELLOW}Tip: To assign a static IP, re-run with --static-ip ${VM_IP}/24${NC}"
-  echo -e "${YELLOW}Or:  qm set ${VM_ID} --ipconfig0 ip=${VM_IP}/24,gw=${GATEWAY_IP} && qm reboot ${VM_ID}${NC}"
-  echo ""
+if [[ -n "$TELEGRAM_TOKEN" ]]; then
+    echo "  Telegram:       Configured (bot token in openclaw.json)"
+else
+    echo "  Telegram:       Not set — add botToken to ~/.openclaw/openclaw.json channels.telegram"
 fi
-echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo "  Firewall:"
+echo "    ✅ ${HA_IP}:${HA_PORT} (Home Assistant)"
+echo "    ✅ ${GRAFANA_IP}:${GRAFANA_PORT} (Grafana)"
+echo "    ❌ Rest of 192.168.178.0/24"
+echo "    ✅ Internet"
+echo ""
+echo "  Model:          zai/glm-4.7 (Z.AI)"
+echo "  Tools:          coding profile, exec full, elevated disabled"
+echo "  Whisper:        small model, German, CLI-based"
+echo ""
+echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}  ⚠️  SAVE the password: ${PASSWORD}${NC}"
+echo -e "${YELLOW}  ⚠️  SAVE the gateway token: ${GATEWAY_TOKEN}${NC}"
+echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
