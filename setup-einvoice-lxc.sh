@@ -47,7 +47,7 @@ SSH_PUBKEY_FILE=""
 
 NAS_IP="192.168.178.74"
 NAS_HOSTNAME="brain"
-NAS_EXPORT="/volume1/praxis"
+NAS_EXPORT="/volume8/praxis"
 HOST_NFS_MOUNT="/mnt/nas-praxis"
 
 KEEPASS_PW=""
