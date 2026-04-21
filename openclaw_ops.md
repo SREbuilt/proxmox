@@ -5,14 +5,15 @@
 > in the `~/openclaw` directory. OpenClaw is installed inside the Docker
 > container, not on the VM host.
 
-### Proxmox VM-Übersicht
+### Proxmox VM/LXC-Übersicht
 
-| VM | Name | IP | RAM | Funktion |
-|----|------|----|-----|----------|
-| 100 | openclaw | 192.168.178.80 | 4 GB | OpenClaw AI Assistant |
-| 101 | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent |
-| 108 | home-assistant | 192.168.178.88 | 6 GB | Home Assistant (prod) |
-| 109 | ha-backup | 192.168.178.x | 1.5 GB | Home Assistant (backup) |
+| ID | Typ | Name | IP | RAM | Funktion | Setup-Script |
+|----|-----|------|----|-----|----------|-------------|
+| 100 | VM | openclaw | 192.168.178.80 | 4 GB | OpenClaw AI Assistant | `niklas_setup-openclaw-vm.sh` |
+| 101 | VM | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent | `setup-hermes-vm.sh` |
+| 102 | LXC | whisper | 192.168.178.82 | 1 GB | Shared Whisper STT | `setup-whisper-lxc.sh` |
+| 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch) | `setup-einvoice-lxc.sh` |
+| 108 | VM | haos151 | 192.168.178.88 | 6.5 GB | Home Assistant OS (prod) | `setup-haos-vm.sh` |
 
 > Für Hermes-spezifische Dokumentation: siehe `SETUP-GUIDE.md`, Option 3.
 > container, not on the VM host.
@@ -150,61 +151,46 @@ docker compose restart openclaw-gateway
 
 Available Z.AI models: `glm-5.1`, `glm-5`, `glm-5-turbo`, `glm-4.7`, `glm-4.7-flash`, `glm-4.6`, `glm-4.5`
 
-### Whisper voice transcription
+### Whisper voice transcription (Shared LXC 102)
 
-Voice messages from Telegram are transcribed by a local Whisper server
-running as a Docker container alongside OpenClaw (network_mode: host,
-CLI-based transcription to bypass SSRF restrictions).
+Voice messages from Telegram are transcribed by a **shared Whisper LXC**
+(LXC 102, IP 192.168.178.82) running faster-whisper-server. Both OpenClaw
+and Hermes access this LXC via the Proxmox firewall whitelist.
 
-#### Change Whisper model size
+OpenClaw uses CLI-based transcription (`type: "cli"` with curl) to bypass
+its built-in SSRF protection that blocks private IP addresses.
 
-Edit `~/openclaw/docker-compose.yml`, find `WHISPER__MODEL` and change:
-
-| Model | RAM | Speed (N150) | Quality |
-|-------|-----|-------------|---------|
-| `tiny` | ~0.5 GB | Schnell | Ausreichend |
-| `base` | ~1 GB | Mittel | Gut |
-| `small` | ~2 GB | Langsam | Sehr gut |
+#### Test Whisper
 
 ```bash
-nano ~/openclaw/docker-compose.yml
-# Change: WHISPER__MODEL=base → WHISPER__MODEL=small (or tiny)
-docker compose down whisper && docker compose up -d whisper
-```
+# From Proxmox host or any whitelisted VM
+curl -sf http://192.168.178.82:8000/health
 
-**Wichtig:** Bei `small` VM-RAM auf 6GB erhöhen (vom Proxmox Host):
-```bash
-qm set 100 --memory 6144
-qm reboot 100
-```
-
-#### Change Whisper language
-
-Edit `~/.openclaw/openclaw.json`, find the audio `"args"` array and
-add/change the language parameter:
-
-```bash
-nano ~/.openclaw/openclaw.json
-# Find: "-F", "response_format=text"]
-# Replace with: "-F", "response_format=text", "-F", "language=de"]
-docker compose restart openclaw-gateway
-```
-
-Supported languages: `de`, `en`, `fr`, `es`, `it`, `pt`, `nl`, `ja`, `zh`, etc.
-Setting the language explicitly improves recognition accuracy significantly.
-
-#### Test Whisper manually
-
-```bash
-# Check Whisper is running
-curl -sf http://127.0.0.1:8000/health
-
-# Test transcription with a file
-curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
+# Test transcription
+curl -X POST http://192.168.178.82:8000/v1/audio/transcriptions \
   -F "file=@/path/to/audio.ogg" \
-  -F "model=Systran/faster-whisper-base" \
+  -F "model=Systran/faster-whisper-small" \
   -F "response_format=text" \
   -F "language=de"
+```
+
+#### Whisper LXC Management
+
+```bash
+# SSH into Whisper LXC
+ssh root@192.168.178.82
+
+# Check container
+cd /root/whisper && docker compose ps
+
+# Restart
+docker compose restart whisper
+
+# View logs
+docker compose logs --tail 50 whisper
+
+# Update
+docker compose pull && docker compose up -d
 ```
 
 ---

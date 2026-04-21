@@ -581,8 +581,96 @@ iptables -F FORWARD
 pve-firewall restart
 ```
 
-> Docker gehört **nur in die VMs** (OpenClaw VM 100, Hermes VM 101),
-> **niemals** auf den Proxmox Host selbst!
+> Docker gehört **nur in die VMs/LXCs** (OpenClaw VM 100, Hermes VM 101,
+> Whisper LXC 102, Invoicing LXC 103), **niemals** auf den Proxmox Host!
+
+---
+
+## Option 4: Shared Whisper LXC (Voice Transcription)
+
+**Best for**: Shared speech-to-text service used by both OpenClaw and Hermes
+for Telegram voice messages.
+
+### Step-by-Step
+
+```bash
+scp setup-whisper-lxc.sh root@<PROXMOX_IP>:/root/
+ssh root@<PROXMOX_IP>
+chmod +x /root/setup-whisper-lxc.sh
+sed -i 's/\r$//' /root/setup-whisper-lxc.sh
+
+./setup-whisper-lxc.sh --ssh-pubkey ~/.ssh/id_ed25519.pub
+```
+
+The script creates LXC 102 (IP .82) with faster-whisper-server, restricted
+by firewall to only accept connections from OpenClaw (.80) and Hermes (.81).
+
+---
+
+## Option 5: e-Invoice LXC (Batch Invoicing)
+
+**Best for**: Running the e-Invoice application as a Docker batch job with
+NAS access via NFS.
+
+### Prerequisites
+
+- Synology NAS with NFS enabled on the `praxis` share
+- GitHub PAT for the private repo
+- KeePassXC master password
+
+### Step-by-Step
+
+```bash
+scp setup-einvoice-lxc.sh root@<PROXMOX_IP>:/root/
+ssh root@<PROXMOX_IP>
+chmod +x /root/setup-einvoice-lxc.sh
+sed -i 's/\r$//' /root/setup-einvoice-lxc.sh
+
+./setup-einvoice-lxc.sh \
+    --ssh-pubkey ~/.ssh/id_ed25519.pub \
+    --keepass-pw "YourKeePassMasterPassword" \
+    --github-pat "ghp_xxxx" \
+    --nas-ip 192.168.178.74
+```
+
+The script:
+- Mounts NAS via NFS on the Proxmox host, bind-mounts into the LXC
+- Creates LXC 103 (IP .83) with Docker
+- Clones the private repo, copies fonts from NAS, builds Docker image
+- Creates convenience commands: `invoice` and `invoice-update`
+
+### Usage
+
+```bash
+# Generate April 2026 invoices (draft)
+ssh root@192.168.178.83 invoice --year 2026 --month 4
+
+# Fire & forget (sends emails)
+ssh root@192.168.178.83 invoice --year 2026 --month 4 --fireforget --prodrun
+
+# Update code + rebuild
+ssh root@192.168.178.83 invoice-update
+```
+
+---
+
+## Option 6: Home Assistant OS VM
+
+**Best for**: Reproducing or creating a new Home Assistant OS VM based on
+the proven VM 108 configuration.
+
+### Step-by-Step
+
+```bash
+scp setup-haos-vm.sh root@<PROXMOX_IP>:/root/
+ssh root@<PROXMOX_IP>
+chmod +x /root/setup-haos-vm.sh
+sed -i 's/\r$//' /root/setup-haos-vm.sh
+
+./setup-haos-vm.sh --vm-id 109
+```
+
+Optional parameters: `--vm-ip`, `--ram`, `--disk`, `--usb-device`, etc.
 
 ---
 
@@ -602,13 +690,17 @@ ssh claw@192.168.178.80 'cd ~/openclaw && docker compose pull && docker compose 
 # Update Hermes (VM 101):
 ssh hermes@192.168.178.81 'cd ~/hermes && docker compose pull && docker compose up -d'
 
-# Update OpenClaw (LXC):
-pct exec <VMID> -- npm update -g openclaw
+# Update Whisper (LXC 102):
+ssh root@192.168.178.82 'cd /root/whisper && docker compose pull && docker compose up -d'
+
+# Update e-Invoice (LXC 103):
+ssh root@192.168.178.83 invoice-update
 
 # Security audit (OpenClaw):
 ssh claw@192.168.178.80 'cd ~/openclaw && docker compose exec openclaw-gateway node openclaw.mjs security audit --deep'
 
-# Check services:
-ssh claw@192.168.178.80 'cd ~/openclaw && docker compose ps'      # OpenClaw
-ssh hermes@192.168.178.81 'cd ~/hermes && docker compose ps'       # Hermes
+# Check all services:
+ssh claw@192.168.178.80 'cd ~/openclaw && docker compose ps'       # OpenClaw
+ssh hermes@192.168.178.81 'cd ~/hermes && docker compose ps'        # Hermes
+ssh root@192.168.178.82 'cd /root/whisper && docker compose ps'     # Whisper
 ```
