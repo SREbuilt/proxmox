@@ -542,6 +542,44 @@ Wechsel des Bridge-Ports:
 5. Bridge-Port ändern: `sed -i 's/old_nic/enp1s0/g' /etc/network/interfaces`
 6. Reboot
 
+### Bridge-Port NIC muss `auto` haben (KRITISCH!)
+
+Ohne `auto enp1s0` wird das NIC beim Boot nicht hochgefahren → vmbr0
+kann nicht starten → **keine VMs, kein Netzwerk**.
+
+```bash
+# ❌ FALSCH — NIC bleibt nach Reboot DOWN, Bridge startet nicht
+iface enp1s0 inet manual
+
+# ✅ RICHTIG — NIC wird beim Boot automatisch hochgefahren
+auto enp1s0
+iface enp1s0 inet manual
+```
+
+**Fix:**
+```bash
+sed -i 's/^iface enp1s0 inet manual/auto enp1s0\niface enp1s0 inet manual/' /etc/network/interfaces
+```
+
+> **Entdeckt 2026-04-22:** Nach Reboot war vmbr0 nicht vorhanden, alle
+> VMs konnten nicht starten. Ursache: `enp1s0` war im `manual` Modus
+> ohne `auto` — der Bridge fehlte der Port. Zusätzlich blockierte ein
+> Docker-Überbleibsel (`/etc/network/if-up.d/docker-bridge-fix`) das
+> Hochfahren von vmbr0.
+
+### Docker-Überbleibsel in Netzwerk-Hooks
+
+Nach dem Entfernen von Docker vom Host bleiben manchmal Hook-Scripts:
+
+```bash
+# Prüfen
+ls /etc/network/if-up.d/ /etc/network/if-pre-up.d/ | grep -i docker
+
+# Entfernen
+rm -f /etc/network/if-up.d/docker-bridge-fix
+rm -f /etc/network/if-pre-up.d/docker-*
+```
+
 ---
 
 ## 12. Allgemeine Shell-Script-Patterns
@@ -699,6 +737,8 @@ history -c && rm -f ~/.bash_history
 | `update-grub` auf ZFS | Tut nichts (kein Fehler, keine Wirkung) |
 | Kernel 6.14+ auf N150 ohne C-State Fix | System-Freeze nach 60-80h |
 | C6DRAM enabled im BIOS | Deep C-States → Freeze |
+| Bridge-Port NIC ohne `auto` | NIC bleibt DOWN nach Boot → vmbr0 fehlt → kein Netzwerk |
+| Docker if-up.d Hooks nach Deinstallation | ifup vmbr0 scheitert durch Leftover-Scripts |
 
 ---
 
@@ -722,3 +762,5 @@ history -c && rm -f ~/.bash_history
 | 14 | `import tkinter` in headless Docker | `ImportError: libtk8.6.so` | Lazy import mit `try/except` |
 | 15 | Docker `ping` ohne NET_RAW | `Operation not permitted` | `cap_add: [NET_RAW]` in compose |
 | 16 | Docker iptables-Chains als Host-Überbleibsel | DOCKER-USER Chain blockiert FORWARD | `iptables -F/-X DOCKER*` manuell |
+| 17 | Bridge-Port NIC ohne `auto` | vmbr0 startet nicht nach Reboot | `auto enp1s0` in interfaces hinzufügen |
+| 18 | Docker if-up.d Hook-Script Überbleibsel | `ifup vmbr0` schlägt fehl | `/etc/network/if-up.d/docker-bridge-fix` entfernen |
