@@ -607,10 +607,11 @@ by firewall to only accept connections from OpenClaw (.80) and Hermes (.81).
 
 ---
 
-## Option 5: e-Invoice LXC (Batch Invoicing) ✅ Tested
+## Option 5: e-Invoice LXC (Batch Invoicing + Web UI) ✅ Tested
 
 **Best for**: Running the e-Invoice application as a Docker batch job with
 NAS access via NFS. Generates PDF invoices from Excel input, sends via email.
+Also provides a web UI on port 8080 for interactive invoice management.
 
 ### Prerequisites
 
@@ -661,6 +662,7 @@ The script:
 - Clones the private repo, copies Century Gothic fonts from NAS, builds Docker image
 - Creates convenience commands: `invoice` and `invoice-update`
 - Verifies NAS read+write access from inside LXC
+- Opens firewall port 8080 for the web UI (LAN access only)
 
 ### Usage
 

@@ -12,7 +12,7 @@
 | 100 | VM | openclaw | 192.168.178.80 | 4 GB | OpenClaw AI Assistant | `niklas_setup-openclaw-vm.sh` |
 | 101 | VM | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent | `setup-hermes-vm.sh` |
 | 102 | LXC | whisper | 192.168.178.82 | 1 GB | Shared Whisper STT | `setup-whisper-lxc.sh` |
-| 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch) | `setup-einvoice-lxc.sh` |
+| 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch + Web :8080) | `setup-einvoice-lxc.sh` |
 | 108 | VM | haos151 | 192.168.178.88 | 6.5 GB | Home Assistant OS (prod) | `setup-haos-vm.sh` |
 
 > Für Hermes-spezifische Dokumentation: siehe `SETUP-GUIDE.md`, Option 3.
@@ -630,6 +630,9 @@ pct enter 103
 
 # Working directory
 cd /opt/e-invoice/e-Invoice
+
+# Web UI (accessible from LAN)
+# http://192.168.178.83:8080
 ```
 
 ### Running Invoices

@@ -230,13 +230,14 @@ policy_out: ACCEPT
 # SSH from LAN
 IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 22 -log nolog
 
+# e-Invoice web UI (LAN only)
+IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 8080 -log nolog
+
 # ICMP (ping)
 IN ACCEPT -p icmp -log nolog
-
-# No inbound service ports — this is a batch job, not a daemon
 EOF
 
-ok "Firewall configured (batch job — no inbound service ports)"
+ok "Firewall configured (SSH + web UI port 8080 + ICMP from LAN)"
 
 ###############################################################################
 # Step 5/8: Start LXC + wait for SSH
