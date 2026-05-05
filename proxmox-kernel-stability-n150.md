@@ -613,6 +613,140 @@ BIOS-Updates können Microcode-Updates enthalten, die CPU-Bugs direkt fixen.
 
 ---
 
+## Sicheres Update/Upgrade-Verfahren
+
+> **Ziel:** Sicherheitspatches und Proxmox-Management-Updates einspielen,
+> ohne die Stabilität zu gefährden. Der gepinnte Kernel und ZFS bleiben
+> unangetastet.
+
+### Grundregeln
+
+| Regel | Warum |
+|-------|-------|
+| **Kernel bleibt gepinnt** auf 6.8.12-16-pve | Neuere Kernel (6.14, 6.17, 7.0) haben Freeze-Berichte auf N150 |
+| **ZFS wird gehalten** (apt-mark hold) | ZFS 2.4.x hat Stabilitätsprobleme auf N100/N150 mit ZFS-Root gemeldet |
+| **Kein Docker auf dem PVE-Host** | Docker-iptables blockieren VM-Bridge-Traffic (FORWARD DROP) |
+| **Neue Kernel werden installiert, aber nicht gebootet** | Der Pin übersteuert `proxmox-default-kernel` |
+
+### Vor dem Update: Prüfen
+
+```bash
+# 1. Aktueller Kernel + Pin-Status
+uname -r
+proxmox-boot-tool kernel list
+# → Pinned kernel: 6.8.12-16-pve
+
+# 2. ZFS-Hold aktiv?
+apt-mark showhold
+# Erwartet: libnvpair3linux, libuutil3linux, libzfs6linux,
+#           zfs-initramfs, zfs-zed, zfsutils-linux
+
+# 3. Falls ZFS-Hold fehlt — jetzt setzen!
+apt-mark hold zfsutils-linux zfs-zed zfs-initramfs \
+    libnvpair3linux libuutil3linux
+
+# 4. Dry-Run — was wird gemacht?
+apt update && apt -s dist-upgrade
+# → Prüfe: "Not Upgrading: 5" (oder mehr) = ZFS-Pakete gehalten
+# → Prüfe: Keine "REMOVING"-Zeile mit kritischen Paketen
+```
+
+### Update durchführen
+
+```bash
+# 5. Upgrade ausführen (ZFS bleibt gehalten)
+apt dist-upgrade -y
+
+# 6. Kernel-Pin verifizieren (KRITISCH vor Reboot!)
+proxmox-boot-tool kernel list
+# → MUSS zeigen: "Pinned kernel: 6.8.12-16-pve"
+# → Falls Pin weg: NICHT rebooten! Erst re-pinnen:
+#    proxmox-boot-tool kernel pin 6.8.12-16-pve
+
+# 7. Bootloader aktualisieren (nach neuen Kernel-Installationen)
+proxmox-boot-tool refresh
+
+# 8. Reboot
+reboot
+```
+
+### Nach dem Reboot: Verifizieren
+
+```bash
+# 9. Kernel + C-State + Version prüfen
+uname -r                           # → 6.8.12-16-pve
+cat /proc/cmdline | grep cstate    # → intel_idle.max_cstate=1 processor.max_cstate=1
+pveversion -v | head -3            # → pve-manager: aktuelle Version
+
+# 10. Alle Workloads gestartet?
+qm list && pct list
+# → Alle STATUS = running
+
+# 11. Netzwerk OK?
+ip link show vmbr0                 # → state UP
+ping -c 1 192.168.178.1            # → Gateway erreichbar
+```
+
+### Was wird aktualisiert (Beispiele)
+
+| Kategorie | Pakete | Risiko |
+|-----------|--------|--------|
+| **Debian-Sicherheit** | openssl, openssh, gnutls, libnss3, samba, sudo, libc6, gnupg | ✅ Kein Risiko |
+| **Intel Microcode** | intel-microcode | ✅ Wichtig für N150-Stabilität! |
+| **Proxmox-Management** | pve-manager, qemu-server, pve-container, pve-firewall | ✅ Point-Releases |
+| **Ceph/Corosync** | ceph 19.2.3-pveX, corosync | ✅ Patch-Updates |
+| **Neue Kernel (nur installiert)** | proxmox-kernel-7.0, 6.17, 6.14 | ⚠️ Werden NICHT gebootet (Pin!) |
+| **ZFS** | zfsutils-linux, zfs-zed | 🛑 GEHALTEN — nicht upgraden |
+
+### Alte Kernel aufräumen (optional, nach stabiler Uptime)
+
+```bash
+# Installierte Kernel anzeigen
+dpkg -l | grep proxmox-kernel | grep -v helper
+
+# Unnötige Kernel entfernen (NICHT den laufenden oder gepinnten!)
+apt remove proxmox-kernel-6.14.11-4-pve-signed  # alter 6.14
+apt remove proxmox-kernel-6.17.2-1-pve-signed   # alter 6.17
+apt remove proxmox-kernel-6.8.12-4-pve-signed   # alter 6.8 Patch
+
+# Bootloader aktualisieren
+proxmox-boot-tool refresh
+```
+
+> **ACHTUNG:** Immer mindestens 2 Kernel behalten: den gepinnten
+> (6.8.12-16-pve) + einen Fallback (z.B. 7.0.0-3-pve).
+
+### Wann ZFS-Hold aufheben?
+
+ZFS 2.4.x darf erst aktualisiert werden, wenn **alle drei** Bedingungen
+erfüllt sind:
+
+1. Proxmox-Forum bestätigt Stabilität auf N100/N150 mit ZFS-Root
+2. Mindestens 2 Monate nach Release ohne gemeldete Probleme
+3. **Vorher Backup:** `vzdump` aller VMs + `zpool status` + `zfs list`
+
+```bash
+# ZFS-Hold aufheben (NUR wenn sicher!)
+apt-mark unhold zfsutils-linux zfs-zed zfs-initramfs \
+    libnvpair3linux libuutil3linux
+apt dist-upgrade -y
+```
+
+### Repo-Hygiene
+
+Folgende Repos sollten auf dem PVE-Host aktiv sein:
+
+| Repo | Datei | Status |
+|------|-------|--------|
+| Debian trixie (main, updates, security) | `/etc/apt/sources.list` | ✅ Aktiv |
+| PVE No-Subscription | `pve-no-subscription.list` | ✅ Aktiv |
+| Ceph Squid No-Subscription | `ceph.sources` | ✅ Aktiv |
+| PVE Enterprise | `pve-enterprise.list` | ❌ Auskommentiert |
+| Ceph Reef | `ceph.list` | ❌ Auskommentiert |
+| **Docker** | — | 🚫 **ENTFERNT** — Docker gehört NUR in VMs/LXCs! |
+
+---
+
 ## Quellen
 
 - [Proxmox Forum: N100/N150 Freeze Reports](https://forum.proxmox.com/tags/n100/)
