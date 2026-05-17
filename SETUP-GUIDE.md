@@ -818,7 +818,92 @@ Then: `git clone forgejo:bvogel/myrepo.git`
 
 - **Forgejo Actions runner** — separate LXC 105 planned, with egress filtering, ephemeral runners, weekly destructive rebuild
 - **External access** — currently LAN-only; for internet exposure, set up a domain + Let's Encrypt
-- **GitHub repo migration** — manual, use Forgejo's "New Migration" UI
+- **GitHub repo migration** — see Option 8 for automated bulk mirror
+
+---
+
+## Option 8: GitHub → Forgejo Bulk Mirror ✅ Tested
+
+**Best for**: Continuous near-real-time replication of GitHub repos to your
+local Forgejo as backup/sovereignty insurance. GitHub remains master, Forgejo
+auto-pulls changes every 10 minutes. See `forgejo-github-mirror-plan.md`
+for the full design rationale (validated by rubber-duck).
+
+### What it does
+
+- Bulk-creates pull mirrors via Forgejo's `/api/v1/repos/migrate` API
+- Idempotent — safe to re-run when new GitHub repos are created
+- Default: mirrors only PRIVATE repos. Add `--include-public` for all.
+- Active repos: poll every 10 min. Archived repos: weekly.
+- Stores GitHub PAT encrypted in Forgejo's DB (rotation: re-run script).
+- 3 cron-managed companion jobs:
+  - **Daily health check** (06:00) — alerts if any mirror stale >2h
+  - **Weekly Git bundles** (Mon 04:00) — true backup to NAS, immune to force-push
+  - Plus the existing **daily Forgejo dump** (03:00) from setup
+
+### Step-by-Step
+
+```bash
+# On PVE host (Forgejo LXC 104 must be running)
+
+# 1. Bump LXC RAM temporarily for initial clone storm
+pct set 104 --memory 1536
+
+# 2. Get GitHub PAT (fine-grained, Contents+Metadata read-only, scoped to repos)
+echo "ghp_xxx..." > /tmp/github-pat.txt && chmod 600 /tmp/github-pat.txt
+
+# 3. Create Forgejo admin PAT via API
+curl -ks -X POST -u "ADMIN:ADMIN_PW" -H "Content-Type: application/json" \
+    -d '{"name":"mirror-bot","scopes":["write:repository","write:organization","write:user","read:admin"]}' \
+    https://192.168.178.84/api/v1/users/ADMIN/tokens | jq -r .sha1 > /root/.forgejo-token
+chmod 600 /root/.forgejo-token
+
+# 4. Create Forgejo org `github-mirror`
+curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"github-mirror","visibility":"private","description":"Mirror from GitHub"}' \
+    https://192.168.178.84/api/v1/orgs
+
+# 5. Bind-mount NAS bundle dir into LXC for backups
+mkdir -p /mnt/nas-praxis/backups/git-bundles
+pct set 104 -mp1 "/mnt/nas-praxis/backups/git-bundles,mp=/nas-bundles"
+
+# 6. Run pilot with the LARGEST repo first (verify resources)
+export GITHUB_PAT=$(cat /tmp/github-pat.txt)
+export FORGEJO_TOKEN=$(cat /root/.forgejo-token)
+# Migrate one repo manually first to validate
+
+# 7. Bulk mirror all PRIVATE repos
+chmod +x /root/mirror-github-to-forgejo.sh
+sed -i 's/\r$//' /root/mirror-github-to-forgejo.sh
+/root/mirror-github-to-forgejo.sh
+
+# 8. Verify mirrors
+curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
+    | jq -r '.[] | "\(.name)\t\(.size)KB"'
+
+# 9. Restore LXC RAM
+pct set 104 --memory 768
+
+# 10. Install monitoring + bundle crons (see openclaw_ops.md "GitHub Mirror Management")
+```
+
+### Tested results (2026-05-17)
+
+- 13 PRIVATE repos mirrored in ~2 minutes
+- Total disk on LXC 104: 252 MB (well within 16 GB)
+- Forgejo peak memory during bulk: 327 MB (within 768 MB)
+- All 13 bundled to NAS at 250 MB total
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `Not Found` from `/orgs/SREbuilt/repos` | SREbuilt is a USER not an org | Use `/user/repos?affiliation=owner` (script already does) |
+| `git bundle: Need a repository` | Git's safe.directory check rejects different UID | Use `git -c safe.directory='*' bundle ...` |
+| Bulk migration counters show 0 | Subshell variable scope (pipe to `while read`) | Cosmetic only — count by listing mirrors after |
+| Mirror stuck not syncing | GitHub auth failed (rotated PAT) | Edit mirror auth via Forgejo UI per repo |
 
 ---
 

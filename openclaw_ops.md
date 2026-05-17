@@ -802,3 +802,96 @@ pct exec 104 -- docker compose -f /opt/forgejo/docker-compose.yml exec -T -u git
 | forgejo-db | ~80 MB | Postgres tuned: shared_buffers=64MB |
 | forgejo-caddy | ~15 MB | Reverse proxy |
 | **Total used** | **~280 MB** | 488 MB headroom for clone/build/backup |
+
+---
+
+## GitHub Mirror Management (LXC 104)
+
+### What's mirrored
+
+All 13 **PRIVATE** repos from `SREbuilt` GitHub account are mirrored to
+Forgejo org `github-mirror`. Pull mirror, 10 min poll interval. Public
+repos NOT mirrored (excluded by design).
+
+```bash
+# List all mirrors
+curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
+    | jq -r '.[] | "\(.name)\t\(.size)KB\t\(.mirror_updated)"'
+```
+
+### Adding new repos
+
+If you create a new private repo on GitHub:
+
+```bash
+# On PVE host
+export GITHUB_PAT=$(cat /root/.github-pat 2>/dev/null || gh auth token)
+export FORGEJO_TOKEN=$(cat /root/.forgejo-token)
+/root/mirror-github-to-forgejo.sh    # idempotent, only adds missing
+```
+
+### Force immediate sync
+
+```bash
+# Sync one repo now
+curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/repos/github-mirror/<repo>/mirror-sync"
+
+# Sync ALL repos now
+for r in $(curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
+    | jq -r '.[].name'); do
+    curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
+        "https://192.168.178.84/api/v1/repos/github-mirror/${r}/mirror-sync"
+done
+```
+
+### Monitoring
+
+| Cron | When | What |
+|------|------|------|
+| `forgejo-mirror-health` | Daily 06:00 | Alert if any mirror not synced in >2h |
+| `forgejo-bundle-snapshot` | Weekly Monday 04:00 | Git bundle ALL mirrored repos → NAS |
+| `forgejo-backup` | Daily 03:00 | Forgejo DB + dump to `/var/lib/forgejo-backups/` |
+
+Logs:
+- `/var/log/forgejo-mirror-health.log`
+- `/var/log/forgejo-bundle-snapshot.log`
+- `/var/log/forgejo-backup.log`
+
+### True backup vs. replica
+
+| Mechanism | Type | Where | Survives GitHub force-push? |
+|-----------|------|-------|---------------------------|
+| Forgejo pull mirror | **Replica** | LXC 104 | ❌ No (follows ref deletion) |
+| Weekly Git bundles | **Backup** | NAS `/mnt/nas-praxis/backups/git-bundles/` | ✅ Yes (point-in-time) |
+
+To restore from a Git bundle:
+```bash
+git clone /mnt/nas-praxis/backups/git-bundles/2026-05-17/repo.bundle restored-repo
+```
+
+### Token rotation
+
+The GitHub PAT is stored encrypted in Forgejo's DB (one copy per mirror,
+~13 copies). To rotate:
+
+```bash
+# Get new PAT from GitHub (fine-grained, Contents+Metadata read-only)
+# Then for each mirror, update via Forgejo UI:
+# https://192.168.178.84/github-mirror/<repo>/settings → Mirror Settings → "Edit"
+```
+
+Or via API (per repo): `PATCH /api/v1/repos/{owner}/{repo}` with new
+`mirror_address`. Plan to script this if needed.
+
+### Mirror scope: PRIVATE only (current decision)
+
+Public SREbuilt repos are deliberately **not** mirrored. They are
+already public on GitHub and don't need a local backup priority. To
+include them in the future:
+
+```bash
+/root/mirror-github-to-forgejo.sh --include-public
+```
