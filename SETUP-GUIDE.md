@@ -718,6 +718,110 @@ Optional parameters: `--vm-ip`, `--ram`, `--disk`, `--usb-device`, etc.
 
 ---
 
+## Option 7: Forgejo LXC (Self-Hosted Git Forge) ✅ Tested
+
+**Best for**: Sovereign self-hosted Git platform — alternative to GitHub.
+Adapted from [Jorijn's hardened Forgejo setup](https://jorijn.com/en/blog/leaving-github-for-forgejo/)
+but using LXC + Docker Compose (proven pattern) instead of bare-metal Docker.
+
+### Architecture
+
+```
+LXC 104 (192.168.178.84)  — 768 MB RAM + 512 MB swap, 16 GB disk
+├── Caddy 2 (reverse proxy, self-signed TLS, ports 80/443)
+├── Forgejo v15.0.2 (web UI on 3000, SSH on 3022)
+└── Postgres 17 (internal Docker network only)
+```
+
+### Security adapted from Jorijn's 5-layer model
+
+| Jorijn (Forgejo on bare-metal NUC) | Our LXC adaptation |
+|------------------------------------|--------------------|
+| KVM VM for runner | Separate LXC 105 (Phase 2, deferred) |
+| gVisor runtime | Deferred (no Actions runner yet) |
+| nftables egress filter | **Proxmox firewall: `policy_out: DROP`**, RFC1918 blocked, DNS/NTP/HTTPS allowed |
+| Weekly destructive rebuild | Cron when runner is added (Phase 2) |
+| Scope-bound runner tokens | Forgejo v15 native repo-specific tokens |
+| Traefik | **Caddy 2** with pre-generated self-signed cert (IP + hostname SANs) |
+
+### Step-by-Step
+
+```bash
+scp setup-forgejo-lxc.sh root@<PROXMOX_IP>:/root/
+ssh root@<PROXMOX_IP>
+chmod +x /root/setup-forgejo-lxc.sh
+sed -i 's/\r$//' /root/setup-forgejo-lxc.sh
+
+# Stop a VM first if RAM is tight (e.g., haos-dev)
+qm stop 109
+
+./setup-forgejo-lxc.sh \
+    --ssh-pubkey /root/.ssh/id_ed25519.pub \
+    --admin-user bvogel \
+    --admin-email your@email.com
+```
+
+Optional: `--ct-id 104  --ct-ip 192.168.178.84  --ram 768  --swap 512  --disk 16`
+
+### What the script does
+
+- Creates LXC 104 (unprivileged Debian 12, onboot=1)
+- Bind-mounts `/var/lib/forgejo-backups` (PVE host) → `/backups` (LXC)
+- Hardens firewall (inbound: SSH/HTTPS/HTTP/3022/ICMP from LAN; outbound: DROP except DNS/NTP/HTTP/HTTPS/SSH)
+- Installs Docker (proven pattern)
+- Pre-generates self-signed cert with IP + hostname SANs (avoids Caddy `tls internal` IP-SNI issues)
+- Deploys Forgejo + Postgres 17 (tuned for 768 MB) + Caddy 2 via Docker Compose
+- Creates admin user
+- Installs daily backup cron at 03:00 (14-day retention)
+- Creates convenience commands: `forgejo-backup`, `forgejo-update <version>`
+- Verifies HTTPS endpoint works
+
+### First-time browser access
+
+```
+https://192.168.178.84/
+→ Accept self-signed cert warning (one-time)
+→ Login with admin user + password printed at end of setup
+```
+
+### Git SSH setup on workstation
+
+Add to `~/.ssh/config`:
+
+```sshconfig
+Host forgejo
+    HostName 192.168.178.84
+    User git
+    Port 3022
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Then: `git clone forgejo:bvogel/myrepo.git`
+
+> **Why port 3022 and not 22?** Port 22 on the LXC is used by the system SSH
+> daemon (for management). Forgejo's Git SSH runs on port 22 inside the
+> container, mapped to host port 3022. This is the simpler approach (no
+> conflict, no need to move system SSH).
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `TLS handshake: internal error` | Caddy `tls internal` produces critical SAN with IP-only — clients reject | Script pre-generates cert with `openssl req` — IP+hostname SANs |
+| `git clone git@192.168.178.84:...` fails | Defaults to port 22 (LXC SSH, not Forgejo) | Use `ssh://git@.84:3022/...` or `~/.ssh/config` Host alias |
+| Browser cert warning | Self-signed cert (LAN-only) | Accept once or install Caddy root CA |
+| `password does not meet complexity` | Forgejo requires upper+lower+digit+special, ≥12 chars | Use mixed-class password |
+| Initial backup test "no such file or directory: /data/git/repositories" | No repos exist yet on fresh install | Expected; backup script skips `forgejo dump` and runs `pg_dump` only until repos exist |
+| Out of memory / Postgres OOM | Default `shared_buffers=128MB` too big for 768 MB LXC | Script tunes Postgres: `shared_buffers=64MB`, `work_mem=2MB` |
+
+### What's NOT included (Phase 2)
+
+- **Forgejo Actions runner** — separate LXC 105 planned, with egress filtering, ephemeral runners, weekly destructive rebuild
+- **External access** — currently LAN-only; for internet exposure, set up a domain + Let's Encrypt
+- **GitHub repo migration** — manual, use Forgejo's "New Migration" UI
+
+---
+
 ## Post-Setup: Connecting Channels
 
 After setup, configure your messaging channels:
@@ -739,6 +843,12 @@ ssh root@192.168.178.82 'cd /root/whisper && docker compose pull && docker compo
 
 # Update e-Invoice (LXC 103):
 ssh root@192.168.178.83 invoice-update
+
+# Update Forgejo (LXC 104):
+ssh root@192.168.178.108 'pct exec 104 -- forgejo-update 15.0.3'
+
+# Backup Forgejo (manual, runs daily at 03:00 automatically):
+ssh root@192.168.178.108 'pct exec 104 -- forgejo-backup'
 
 # Security audit (OpenClaw):
 ssh claw@192.168.178.80 'cd ~/openclaw && docker compose exec openclaw-gateway node openclaw.mjs security audit --deep'

@@ -13,6 +13,7 @@
 | 101 | VM | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent | `setup-hermes-vm.sh` |
 | 102 | LXC | whisper | 192.168.178.82 | 1 GB | Shared Whisper STT | `setup-whisper-lxc.sh` |
 | 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch + Web :8080) | `setup-einvoice-lxc.sh` |
+| 104 | LXC | forgejo | 192.168.178.84 | 768 MB | Self-hosted Git forge | `setup-forgejo-lxc.sh` |
 | 108 | VM | haos151 | 192.168.178.88 | 6.5 GB | Home Assistant OS (prod) | `setup-haos-vm.sh` |
 
 > Für Hermes-spezifische Dokumentation: siehe `SETUP-GUIDE.md`, Option 3.
@@ -706,3 +707,98 @@ nano /opt/e-invoice/e-Invoice/.env
 # OTEL_EXPORTER_OTLP_ENDPOINT=... (Optional, für SigNoz)
 # NAS_MOUNT=/nas/praxis            (Standard)
 ```
+
+---
+
+## Forgejo LXC Management (LXC 104)
+
+### Access
+
+```bash
+# From PVE host
+pct enter 104
+
+# Working directory
+cd /opt/forgejo
+
+# Web UI (accept self-signed cert warning on first visit)
+# https://192.168.178.84/
+
+# API
+curl -ks -u USERNAME https://192.168.178.84/api/v1/user
+```
+
+### Git SSH client setup
+
+Add to `~/.ssh/config` on your workstation:
+
+```sshconfig
+Host forgejo
+    HostName 192.168.178.84
+    User git
+    Port 3022
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Then clone: `git clone forgejo:bvogel/myrepo.git`
+
+### Backup & restore
+
+```bash
+# Manual backup (PVE host)
+pct exec 104 -- forgejo-backup
+
+# Backups live on PVE host (bind-mounted to /backups inside LXC)
+ls -lh /var/lib/forgejo-backups/
+
+# Restore Postgres only (fast)
+gunzip < /var/lib/forgejo-backups/postgres-YYYYMMDD-HHMMSS.sql.gz | \
+    pct exec 104 -- docker exec -i forgejo-db psql -U forgejo forgejo
+
+# Restore full forgejo dump (after first backup with repos)
+# See: https://forgejo.org/docs/latest/admin/backup-and-restore/
+```
+
+### Update Forgejo
+
+```bash
+# Pinned-version update (with auto backup first)
+pct exec 104 -- forgejo-update 15.0.3
+```
+
+### Docker stack management
+
+```bash
+pct enter 104
+cd /opt/forgejo
+docker compose ps                    # Status
+docker compose logs -f forgejo       # Follow logs
+docker compose restart forgejo       # Restart Forgejo only
+docker compose down && docker compose up -d   # Recreate everything
+```
+
+### Add user (admin only)
+
+```bash
+pct exec 104 -- docker compose -f /opt/forgejo/docker-compose.yml exec -T -u git forgejo \
+    forgejo admin user create --username newuser --password 'StrongPw!23' \
+    --email user@example.com --must-change-password=true
+```
+
+### Security notes
+
+- **Registration disabled** — only admin creates users (`DISABLE_REGISTRATION=true`)
+- **Sign-in required** — even read access requires login (`REQUIRE_SIGNIN_VIEW=true`)
+- **Outbound firewall** blocks LAN sniffing (RFC1918 dropped except DNS/NTP to gateway)
+- **Self-signed cert** valid 10 years, IP+hostname SANs (`/opt/forgejo/certs/`)
+- **Postgres** isolated on internal Docker network (not published to LAN)
+- **Repo-specific tokens** available via Forgejo v15 UI (recommended over personal tokens)
+
+### Memory budget (768 MB)
+
+| Container | Idle | Notes |
+|-----------|------|-------|
+| forgejo | ~185 MB | Go binary, scales with active users |
+| forgejo-db | ~80 MB | Postgres tuned: shared_buffers=64MB |
+| forgejo-caddy | ~15 MB | Reverse proxy |
+| **Total used** | **~280 MB** | 488 MB headroom for clone/build/backup |
