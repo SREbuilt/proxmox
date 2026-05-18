@@ -13,7 +13,7 @@
 | 101 | VM | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent | `setup-hermes-vm.sh` |
 | 102 | LXC | whisper | 192.168.178.82 | 1 GB | Shared Whisper STT | `setup-whisper-lxc.sh` |
 | 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch + Web :8080) | `setup-einvoice-lxc.sh` |
-| 104 | LXC | forgejo | 192.168.178.84 | 768 MB | Self-hosted Git forge | `setup-forgejo-lxc.sh` |
+| 104 | LXC | forgejo | 192.168.178.84 | 256 MB | Self-hosted Git forge | `setup-forgejo-lxc.sh` |
 | 108 | VM | haos151 | 192.168.178.88 | 6.5 GB | Home Assistant OS (prod) | `setup-haos-vm.sh` |
 
 > Für Hermes-spezifische Dokumentation: siehe `SETUP-GUIDE.md`, Option 3.
@@ -794,14 +794,18 @@ pct exec 104 -- docker compose -f /opt/forgejo/docker-compose.yml exec -T -u git
 - **Postgres** isolated on internal Docker network (not published to LAN)
 - **Repo-specific tokens** available via Forgejo v15 UI (recommended over personal tokens)
 
-### Memory budget (768 MB)
+### Memory budget (256 MB)
 
 | Container | Idle | Notes |
 |-----------|------|-------|
-| forgejo | ~185 MB | Go binary, scales with active users |
-| forgejo-db | ~80 MB | Postgres tuned: shared_buffers=64MB |
-| forgejo-caddy | ~15 MB | Reverse proxy |
-| **Total used** | **~280 MB** | 488 MB headroom for clone/build/backup |
+| forgejo | ~17 MB | Go binary, scales with active users |
+| forgejo-db | ~37 MB | Postgres tuned: shared_buffers=32MB |
+| forgejo-caddy | ~19 MB | Reverse proxy |
+| **Total used** | **~75 MB** | 180 MB headroom for clone/build/backup |
+
+> Forgejo idles far lower than typical estimates. Bump to 1.5 GB temporarily
+> with `pct set 104 --memory 1536` during heavy operations (large repo
+> migrations, bulk mirrors), then restore to 256 MB.
 
 ---
 

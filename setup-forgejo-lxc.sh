@@ -51,7 +51,7 @@ set -euo pipefail
 CT_ID=104
 CT_IP="192.168.178.84"
 GATEWAY="192.168.178.1"
-RAM=768
+RAM=256
 SWAP=512
 DISK=16
 BRIDGE="vmbr0"
@@ -394,19 +394,19 @@ services:
       - POSTGRES_PASSWORD=\${DB_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    # Tuned for 768MB LXC RAM (Postgres default 128MB shared_buffers is too large)
+    # Tuned for 256MB LXC RAM (Postgres default 128MB shared_buffers far too large)
     command:
       - postgres
       - -c
-      - shared_buffers=64MB
+      - shared_buffers=32MB
       - -c
       - work_mem=2MB
       - -c
-      - maintenance_work_mem=32MB
+      - maintenance_work_mem=16MB
       - -c
       - max_connections=20
       - -c
-      - effective_cache_size=256MB
+      - effective_cache_size=128MB
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forgejo -d forgejo"]
       interval: 10s

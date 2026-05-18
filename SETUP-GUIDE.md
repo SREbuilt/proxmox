@@ -727,7 +727,7 @@ but using LXC + Docker Compose (proven pattern) instead of bare-metal Docker.
 ### Architecture
 
 ```
-LXC 104 (192.168.178.84)  — 768 MB RAM + 512 MB swap, 16 GB disk
+LXC 104 (192.168.178.84)  — 256 MB RAM + 512 MB swap, 16 GB disk
 ├── Caddy 2 (reverse proxy, self-signed TLS, ports 80/443)
 ├── Forgejo v15.0.2 (web UI on 3000, SSH on 3022)
 └── Postgres 17 (internal Docker network only)
@@ -770,7 +770,7 @@ Optional: `--ct-id 104  --ct-ip 192.168.178.84  --ram 768  --swap 512  --disk 16
 - Hardens firewall (inbound: SSH/HTTPS/HTTP/3022/ICMP from LAN; outbound: DROP except DNS/NTP/HTTP/HTTPS/SSH)
 - Installs Docker (proven pattern)
 - Pre-generates self-signed cert with IP + hostname SANs (avoids Caddy `tls internal` IP-SNI issues)
-- Deploys Forgejo + Postgres 17 (tuned for 768 MB) + Caddy 2 via Docker Compose
+- Deploys Forgejo + Postgres 17 (tuned for 256 MB) + Caddy 2 via Docker Compose
 - Creates admin user
 - Installs daily backup cron at 03:00 (14-day retention)
 - Creates convenience commands: `forgejo-backup`, `forgejo-update <version>`
@@ -813,7 +813,7 @@ Then: `git clone forgejo:bvogel/myrepo.git`
 | `password does not meet complexity` | Forgejo requires upper+lower+digit+special, ≥12 chars | Use mixed-class password |
 | Initial backup test "no such file or directory: /data/git/repositories" | No repos exist yet on fresh install | Expected; backup script skips `forgejo dump` and runs `pg_dump` only until repos exist |
 | `open /backups/...: permission denied` in backup log | Unprivileged LXC: PVE host's `/var/lib/forgejo-backups` owned by UID 0 maps to "nobody" inside LXC | `chown 100000:100000 /var/lib/forgejo-backups` on PVE host (UID 100000 = root inside LXC) |
-| Out of memory / Postgres OOM | Default `shared_buffers=128MB` too big for 768 MB LXC | Script tunes Postgres: `shared_buffers=64MB`, `work_mem=2MB` |
+| Out of memory / Postgres OOM | Default `shared_buffers=128MB` too big for 256 MB LXC | Script tunes Postgres: `shared_buffers=32MB`, `work_mem=2MB`, `effective_cache_size=128MB` |
 
 ### What's NOT included (Phase 2)
 
@@ -895,7 +895,7 @@ shred -u /tmp/github-pat.txt
 
 - 13 PRIVATE repos mirrored in ~2 minutes
 - Total disk on LXC 104: 252 MB (well within 16 GB)
-- Forgejo peak memory during bulk: 327 MB (within 768 MB)
+- Forgejo peak memory during bulk: 327 MB (use temp `pct set 104 --memory 1536` during bulk; actual idle ~75 MB)
 - All 13 bundled to NAS at 250 MB total
 
 ### Troubleshooting
