@@ -865,29 +865,30 @@ curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
     -d '{"username":"github-mirror","visibility":"private","description":"Mirror from GitHub"}' \
     https://192.168.178.84/api/v1/orgs
 
-# 5. Bind-mount NAS bundle dir into LXC for backups
-mkdir -p /mnt/nas-praxis/backups/git-bundles
-pct set 104 -mp1 "/mnt/nas-praxis/backups/git-bundles,mp=/nas-bundles"
+# 5. Copy and run the mirror script (does EVERYTHING: mirror, NAS bind-mount,
+#    install monitoring scripts, install crons, run initial health check)
+scp mirror-github-to-forgejo.sh root@<PROXMOX_IP>:/root/
+chmod +x /root/mirror-github-to-forgejo.sh
 
-# 6. Run pilot with the LARGEST repo first (verify resources)
 export GITHUB_PAT=$(cat /tmp/github-pat.txt)
 export FORGEJO_TOKEN=$(cat /root/.forgejo-token)
-# Migrate one repo manually first to validate
-
-# 7. Bulk mirror all PRIVATE repos
-chmod +x /root/mirror-github-to-forgejo.sh
-sed -i 's/\r$//' /root/mirror-github-to-forgejo.sh
 /root/mirror-github-to-forgejo.sh
+# → mirrors all PRIVATE repos
+# → bind-mounts /mnt/nas-praxis/backups/git-bundles → /nas-bundles in LXC
+# → installs /usr/local/bin/forgejo-mirror-health (daily 06:00 cron)
+# → installs /usr/local/bin/forgejo-bundle-snapshot (weekly Mon 04:00 cron)
+# → runs initial health check
 
-# 8. Verify mirrors
+# 6. Verify mirrors
 curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
     "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
     | jq -r '.[] | "\(.name)\t\(.size)KB"'
 
-# 9. Restore LXC RAM
+# 7. Restore LXC RAM
 pct set 104 --memory 768
 
-# 10. Install monitoring + bundle crons (see openclaw_ops.md "GitHub Mirror Management")
+# 8. Clean up PAT file
+shred -u /tmp/github-pat.txt
 ```
 
 ### Tested results (2026-05-17)
@@ -903,6 +904,9 @@ pct set 104 --memory 768
 |---------|-------|-----|
 | `Not Found` from `/orgs/SREbuilt/repos` | SREbuilt is a USER not an org | Use `/user/repos?affiliation=owner` (script already does) |
 | `git bundle: Need a repository` | Git's safe.directory check rejects different UID | Use `git -c safe.directory='*' bundle ...` |
+| `git bundle: Need a repository` | Git's safe.directory check rejects different UID | Use `git -c safe.directory='*' bundle ...` |
+| `pct: command not found` in cron | Cron's minimal PATH excludes `/usr/sbin` | Add `PATH=/usr/sbin:/usr/bin:/sbin:/bin` to cron file (script does this) |
+| `mountpoint -q` returns false but NAS mounted | `dirname` of `/mnt/nas-praxis/backups/git-bundles` ≠ mountpoint | Script now uses `touch test-write` to detect writability |
 | Bulk migration counters show 0 | Subshell variable scope (pipe to `while read`) | Cosmetic only — count by listing mirrors after |
 | Mirror stuck not syncing | GitHub auth failed (rotated PAT) | Edit mirror auth via Forgejo UI per repo |
 
