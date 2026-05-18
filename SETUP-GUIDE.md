@@ -812,6 +812,7 @@ Then: `git clone forgejo:bvogel/myrepo.git`
 | Browser cert warning | Self-signed cert (LAN-only) | Accept once or install Caddy root CA |
 | `password does not meet complexity` | Forgejo requires upper+lower+digit+special, ≥12 chars | Use mixed-class password |
 | Initial backup test "no such file or directory: /data/git/repositories" | No repos exist yet on fresh install | Expected; backup script skips `forgejo dump` and runs `pg_dump` only until repos exist |
+| `open /backups/...: permission denied` in backup log | Unprivileged LXC: PVE host's `/var/lib/forgejo-backups` owned by UID 0 maps to "nobody" inside LXC | `chown 100000:100000 /var/lib/forgejo-backups` on PVE host (UID 100000 = root inside LXC) |
 | Out of memory / Postgres OOM | Default `shared_buffers=128MB` too big for 768 MB LXC | Script tunes Postgres: `shared_buffers=64MB`, `work_mem=2MB` |
 
 ### What's NOT included (Phase 2)

@@ -768,3 +768,4 @@ history -c && rm -f ~/.bash_history
 | 20 | Forgejo Password Complexity blockiert random-Passwort | `password does not meet complexity requirements` | Mind. 12 Zeichen mit upper+lower+digit+special — `Forge$(rand)Jo!9` Pattern |
 | 21 | `forgejo dump` schlägt fehl bei leerem Forge | `Failed to include repositories: /data/git/repositories: no such file` | Backup-Script muss Repo-Existenz prüfen, sonst nur `pg_dump` |
 | 22 | PowerShell `$(...)` Substitution vor SSH | `'openssl' is not recognized` | Single quotes um SSH command — PS expandiert sonst auf Client-Seite |
+| 23 | Bind-mount in unprivilegierter LXC nicht beschreibbar | `open /backups/...: permission denied` (Docker cp / forgejo dump) | Host-Dir muss `100000:100000` gehören (PVE UID 100000 = LXC UID 0). `chown 100000:100000 /var/lib/forgejo-backups` |

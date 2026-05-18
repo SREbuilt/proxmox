@@ -154,7 +154,11 @@ fi
 info "Step 2/9: Preparing backup directory on PVE host..."
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
-ok "Backup directory: ${BACKUP_DIR}"
+# Unprivileged LXC: UID 0 in LXC = UID 100000 on host. The bind-mount
+# remaps ownership, so /backups inside LXC is unwritable unless host
+# directory is owned by 100000:100000.
+chown 100000:100000 "$BACKUP_DIR"
+ok "Backup directory: ${BACKUP_DIR} (owner 100000:100000 for unprivileged LXC mapping)"
 
 ###############################################################################
 # Step 3/9: Create LXC
