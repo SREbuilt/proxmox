@@ -718,6 +718,200 @@ Optional parameters: `--vm-ip`, `--ram`, `--disk`, `--usb-device`, etc.
 
 ---
 
+## Option 7: Forgejo LXC (Self-Hosted Git Forge) ✅ Tested
+
+**Best for**: Sovereign self-hosted Git platform — alternative to GitHub.
+Adapted from [Jorijn's hardened Forgejo setup](https://jorijn.com/en/blog/leaving-github-for-forgejo/)
+but using LXC + Docker Compose (proven pattern) instead of bare-metal Docker.
+
+### Architecture
+
+```
+LXC 104 (192.168.178.84)  — 256 MB RAM + 512 MB swap, 16 GB disk
+├── Caddy 2 (reverse proxy, self-signed TLS, ports 80/443)
+├── Forgejo v15.0.2 (web UI on 3000, SSH on 3022)
+└── Postgres 17 (internal Docker network only)
+```
+
+### Security adapted from Jorijn's 5-layer model
+
+| Jorijn (Forgejo on bare-metal NUC) | Our LXC adaptation |
+|------------------------------------|--------------------|
+| KVM VM for runner | Separate LXC 105 (Phase 2, deferred) |
+| gVisor runtime | Deferred (no Actions runner yet) |
+| nftables egress filter | **Proxmox firewall: `policy_out: DROP`**, RFC1918 blocked, DNS/NTP/HTTPS allowed |
+| Weekly destructive rebuild | Cron when runner is added (Phase 2) |
+| Scope-bound runner tokens | Forgejo v15 native repo-specific tokens |
+| Traefik | **Caddy 2** with pre-generated self-signed cert (IP + hostname SANs) |
+
+### Step-by-Step
+
+```bash
+scp setup-forgejo-lxc.sh root@<PROXMOX_IP>:/root/
+ssh root@<PROXMOX_IP>
+chmod +x /root/setup-forgejo-lxc.sh
+sed -i 's/\r$//' /root/setup-forgejo-lxc.sh
+
+# Stop a VM first if RAM is tight (e.g., haos-dev)
+qm stop 109
+
+./setup-forgejo-lxc.sh \
+    --ssh-pubkey /root/.ssh/id_ed25519.pub \
+    --admin-user bvogel \
+    --admin-email your@email.com
+```
+
+Optional: `--ct-id 104  --ct-ip 192.168.178.84  --ram 768  --swap 512  --disk 16`
+
+### What the script does
+
+- Creates LXC 104 (unprivileged Debian 12, onboot=1)
+- Bind-mounts `/var/lib/forgejo-backups` (PVE host) → `/backups` (LXC)
+- Hardens firewall (inbound: SSH/HTTPS/HTTP/3022/ICMP from LAN; outbound: DROP except DNS/NTP/HTTP/HTTPS/SSH)
+- Installs Docker (proven pattern)
+- Pre-generates self-signed cert with IP + hostname SANs (avoids Caddy `tls internal` IP-SNI issues)
+- Deploys Forgejo + Postgres 17 (tuned for 256 MB) + Caddy 2 via Docker Compose
+- Creates admin user
+- Installs daily backup cron at 03:00 (14-day retention)
+- Creates convenience commands: `forgejo-backup`, `forgejo-update <version>`
+- Verifies HTTPS endpoint works
+
+### First-time browser access
+
+```
+https://192.168.178.84/
+→ Accept self-signed cert warning (one-time)
+→ Login with admin user + password printed at end of setup
+```
+
+### Git SSH setup on workstation
+
+Add to `~/.ssh/config`:
+
+```sshconfig
+Host forgejo
+    HostName 192.168.178.84
+    User git
+    Port 3022
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Then: `git clone forgejo:bvogel/myrepo.git`
+
+> **Why port 3022 and not 22?** Port 22 on the LXC is used by the system SSH
+> daemon (for management). Forgejo's Git SSH runs on port 22 inside the
+> container, mapped to host port 3022. This is the simpler approach (no
+> conflict, no need to move system SSH).
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `TLS handshake: internal error` | Caddy `tls internal` produces critical SAN with IP-only — clients reject | Script pre-generates cert with `openssl req` — IP+hostname SANs |
+| `git clone git@192.168.178.84:...` fails | Defaults to port 22 (LXC SSH, not Forgejo) | Use `ssh://git@.84:3022/...` or `~/.ssh/config` Host alias |
+| Browser cert warning | Self-signed cert (LAN-only) | Accept once or install Caddy root CA |
+| `password does not meet complexity` | Forgejo requires upper+lower+digit+special, ≥12 chars | Use mixed-class password |
+| Initial backup test "no such file or directory: /data/git/repositories" | No repos exist yet on fresh install | Expected; backup script skips `forgejo dump` and runs `pg_dump` only until repos exist |
+| `open /backups/...: permission denied` in backup log | Unprivileged LXC: PVE host's `/var/lib/forgejo-backups` owned by UID 0 maps to "nobody" inside LXC | `chown 100000:100000 /var/lib/forgejo-backups` on PVE host (UID 100000 = root inside LXC) |
+| Out of memory / Postgres OOM | Default `shared_buffers=128MB` too big for 256 MB LXC | Script tunes Postgres: `shared_buffers=32MB`, `work_mem=2MB`, `effective_cache_size=128MB` |
+
+### What's NOT included (Phase 2)
+
+- **Forgejo Actions runner** — separate LXC 105 planned, with egress filtering, ephemeral runners, weekly destructive rebuild
+- **External access** — currently LAN-only; for internet exposure, set up a domain + Let's Encrypt
+- **GitHub repo migration** — see Option 8 for automated bulk mirror
+
+---
+
+## Option 8: GitHub → Forgejo Bulk Mirror ✅ Tested
+
+**Best for**: Continuous near-real-time replication of GitHub repos to your
+local Forgejo as backup/sovereignty insurance. GitHub remains master, Forgejo
+auto-pulls changes every 10 minutes. See `forgejo-github-mirror-plan.md`
+for the full design rationale (validated by rubber-duck).
+
+### What it does
+
+- Bulk-creates pull mirrors via Forgejo's `/api/v1/repos/migrate` API
+- Idempotent — safe to re-run when new GitHub repos are created
+- Default: mirrors only PRIVATE repos. Add `--include-public` for all.
+- Active repos: poll every 10 min. Archived repos: weekly.
+- Stores GitHub PAT encrypted in Forgejo's DB (rotation: re-run script).
+- 3 cron-managed companion jobs:
+  - **Daily health check** (06:00) — alerts if any mirror stale >2h
+  - **Weekly Git bundles** (Mon 04:00) — true backup to NAS, immune to force-push
+  - Plus the existing **daily Forgejo dump** (03:00) from setup
+
+### Step-by-Step
+
+```bash
+# On PVE host (Forgejo LXC 104 must be running)
+
+# 1. Bump LXC RAM temporarily for initial clone storm
+pct set 104 --memory 1536
+
+# 2. Get GitHub PAT (fine-grained, Contents+Metadata read-only, scoped to repos)
+echo "ghp_xxx..." > /tmp/github-pat.txt && chmod 600 /tmp/github-pat.txt
+
+# 3. Create Forgejo admin PAT via API
+curl -ks -X POST -u "ADMIN:ADMIN_PW" -H "Content-Type: application/json" \
+    -d '{"name":"mirror-bot","scopes":["write:repository","write:organization","write:user","read:admin"]}' \
+    https://192.168.178.84/api/v1/users/ADMIN/tokens | jq -r .sha1 > /root/.forgejo-token
+chmod 600 /root/.forgejo-token
+
+# 4. Create Forgejo org `github-mirror`
+curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"github-mirror","visibility":"private","description":"Mirror from GitHub"}' \
+    https://192.168.178.84/api/v1/orgs
+
+# 5. Copy and run the mirror script (does EVERYTHING: mirror, NAS bind-mount,
+#    install monitoring scripts, install crons, run initial health check)
+scp mirror-github-to-forgejo.sh root@<PROXMOX_IP>:/root/
+chmod +x /root/mirror-github-to-forgejo.sh
+
+export GITHUB_PAT=$(cat /tmp/github-pat.txt)
+export FORGEJO_TOKEN=$(cat /root/.forgejo-token)
+/root/mirror-github-to-forgejo.sh
+# → mirrors all PRIVATE repos
+# → bind-mounts /mnt/nas-praxis/backups/git-bundles → /nas-bundles in LXC
+# → installs /usr/local/bin/forgejo-mirror-health (daily 06:00 cron)
+# → installs /usr/local/bin/forgejo-bundle-snapshot (weekly Mon 04:00 cron)
+# → runs initial health check
+
+# 6. Verify mirrors
+curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
+    | jq -r '.[] | "\(.name)\t\(.size)KB"'
+
+# 7. Restore LXC RAM
+pct set 104 --memory 768
+
+# 8. Clean up PAT file
+shred -u /tmp/github-pat.txt
+```
+
+### Tested results (2026-05-17)
+
+- 13 PRIVATE repos mirrored in ~2 minutes
+- Total disk on LXC 104: 252 MB (well within 16 GB)
+- Forgejo peak memory during bulk: 327 MB (use temp `pct set 104 --memory 1536` during bulk; actual idle ~75 MB)
+- All 13 bundled to NAS at 250 MB total
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `Not Found` from `/orgs/SREbuilt/repos` | SREbuilt is a USER not an org | Use `/user/repos?affiliation=owner` (script already does) |
+| `git bundle: Need a repository` | Git's safe.directory check rejects different UID | Use `git -c safe.directory='*' bundle ...` |
+| `git bundle: Need a repository` | Git's safe.directory check rejects different UID | Use `git -c safe.directory='*' bundle ...` |
+| `pct: command not found` in cron | Cron's minimal PATH excludes `/usr/sbin` | Add `PATH=/usr/sbin:/usr/bin:/sbin:/bin` to cron file (script does this) |
+| `mountpoint -q` returns false but NAS mounted | `dirname` of `/mnt/nas-praxis/backups/git-bundles` ≠ mountpoint | Script now uses `touch test-write` to detect writability |
+| Bulk migration counters show 0 | Subshell variable scope (pipe to `while read`) | Cosmetic only — count by listing mirrors after |
+| Mirror stuck not syncing | GitHub auth failed (rotated PAT) | Edit mirror auth via Forgejo UI per repo |
+
+---
+
 ## Post-Setup: Connecting Channels
 
 After setup, configure your messaging channels:
@@ -739,6 +933,12 @@ ssh root@192.168.178.82 'cd /root/whisper && docker compose pull && docker compo
 
 # Update e-Invoice (LXC 103):
 ssh root@192.168.178.83 invoice-update
+
+# Update Forgejo (LXC 104):
+ssh root@192.168.178.108 'pct exec 104 -- forgejo-update 15.0.3'
+
+# Backup Forgejo (manual, runs daily at 03:00 automatically):
+ssh root@192.168.178.108 'pct exec 104 -- forgejo-backup'
 
 # Security audit (OpenClaw):
 ssh claw@192.168.178.80 'cd ~/openclaw && docker compose exec openclaw-gateway node openclaw.mjs security audit --deep'

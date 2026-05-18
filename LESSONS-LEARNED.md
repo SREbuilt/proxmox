@@ -764,3 +764,9 @@ history -c && rm -f ~/.bash_history
 | 16 | Docker iptables-Chains als Host-Überbleibsel | DOCKER-USER Chain blockiert FORWARD | `iptables -F/-X DOCKER*` manuell |
 | 17 | Bridge-Port NIC ohne `auto` | vmbr0 startet nicht nach Reboot | `auto enp1s0` in interfaces hinzufügen |
 | 18 | Docker if-up.d Hook-Script Überbleibsel | `ifup vmbr0` schlägt fehl | `/etc/network/if-up.d/docker-bridge-fix` entfernen |
+| 19 | Caddy `tls internal` mit IP statt Hostname | `TLS alert: internal error` — Client lehnt Handshake ab | Cert manuell mit `openssl req` generieren (IP + Hostname SAN, kein "critical" SAN-only) |
+| 20 | Forgejo Password Complexity blockiert random-Passwort | `password does not meet complexity requirements` | Mind. 12 Zeichen mit upper+lower+digit+special — `Forge$(rand)Jo!9` Pattern |
+| 21 | `forgejo dump` schlägt fehl bei leerem Forge | `Failed to include repositories: /data/git/repositories: no such file` | Backup-Script muss Repo-Existenz prüfen, sonst nur `pg_dump` |
+| 22 | PowerShell `$(...)` Substitution vor SSH | `'openssl' is not recognized` | Single quotes um SSH command — PS expandiert sonst auf Client-Seite |
+| 23 | Bind-mount in unprivilegierter LXC nicht beschreibbar | `open /backups/...: permission denied` (Docker cp / forgejo dump) | Host-Dir muss `100000:100000` gehören (PVE UID 100000 = LXC UID 0). `chown 100000:100000 /var/lib/forgejo-backups` |
+| 24 | Cron-PATH ohne `/usr/sbin` | `pct: command not found` in cron log | `PATH=/usr/sbin:/usr/bin:/sbin:/bin` als erste Zeile der `/etc/cron.d/*` Datei, oder absoluten Pfad im Script nutzen |

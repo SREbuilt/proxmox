@@ -13,6 +13,7 @@
 | 101 | VM | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent | `setup-hermes-vm.sh` |
 | 102 | LXC | whisper | 192.168.178.82 | 1 GB | Shared Whisper STT | `setup-whisper-lxc.sh` |
 | 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch + Web :8080) | `setup-einvoice-lxc.sh` |
+| 104 | LXC | forgejo | 192.168.178.84 | 256 MB | Self-hosted Git forge | `setup-forgejo-lxc.sh` |
 | 108 | VM | haos151 | 192.168.178.88 | 6.5 GB | Home Assistant OS (prod) | `setup-haos-vm.sh` |
 
 > Für Hermes-spezifische Dokumentation: siehe `SETUP-GUIDE.md`, Option 3.
@@ -705,4 +706,196 @@ nano /opt/e-invoice/e-Invoice/.env
 # KEEPASSXC_MASTER_PASSWORD=...   (Pflicht)
 # OTEL_EXPORTER_OTLP_ENDPOINT=... (Optional, für SigNoz)
 # NAS_MOUNT=/nas/praxis            (Standard)
+```
+
+---
+
+## Forgejo LXC Management (LXC 104)
+
+### Access
+
+```bash
+# From PVE host
+pct enter 104
+
+# Working directory
+cd /opt/forgejo
+
+# Web UI (accept self-signed cert warning on first visit)
+# https://192.168.178.84/
+
+# API
+curl -ks -u USERNAME https://192.168.178.84/api/v1/user
+```
+
+### Git SSH client setup
+
+Add to `~/.ssh/config` on your workstation:
+
+```sshconfig
+Host forgejo
+    HostName 192.168.178.84
+    User git
+    Port 3022
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Then clone: `git clone forgejo:bvogel/myrepo.git`
+
+### Backup & restore
+
+```bash
+# Manual backup (PVE host)
+pct exec 104 -- forgejo-backup
+
+# Backups live on PVE host (bind-mounted to /backups inside LXC)
+ls -lh /var/lib/forgejo-backups/
+
+# Restore Postgres only (fast)
+gunzip < /var/lib/forgejo-backups/postgres-YYYYMMDD-HHMMSS.sql.gz | \
+    pct exec 104 -- docker exec -i forgejo-db psql -U forgejo forgejo
+
+# Restore full forgejo dump (after first backup with repos)
+# See: https://forgejo.org/docs/latest/admin/backup-and-restore/
+```
+
+### Update Forgejo
+
+```bash
+# Pinned-version update (with auto backup first)
+pct exec 104 -- forgejo-update 15.0.3
+```
+
+### Docker stack management
+
+```bash
+pct enter 104
+cd /opt/forgejo
+docker compose ps                    # Status
+docker compose logs -f forgejo       # Follow logs
+docker compose restart forgejo       # Restart Forgejo only
+docker compose down && docker compose up -d   # Recreate everything
+```
+
+### Add user (admin only)
+
+```bash
+pct exec 104 -- docker compose -f /opt/forgejo/docker-compose.yml exec -T -u git forgejo \
+    forgejo admin user create --username newuser --password 'StrongPw!23' \
+    --email user@example.com --must-change-password=true
+```
+
+### Security notes
+
+- **Registration disabled** — only admin creates users (`DISABLE_REGISTRATION=true`)
+- **Sign-in required** — even read access requires login (`REQUIRE_SIGNIN_VIEW=true`)
+- **Outbound firewall** blocks LAN sniffing (RFC1918 dropped except DNS/NTP to gateway)
+- **Self-signed cert** valid 10 years, IP+hostname SANs (`/opt/forgejo/certs/`)
+- **Postgres** isolated on internal Docker network (not published to LAN)
+- **Repo-specific tokens** available via Forgejo v15 UI (recommended over personal tokens)
+
+### Memory budget (256 MB)
+
+| Container | Idle | Notes |
+|-----------|------|-------|
+| forgejo | ~17 MB | Go binary, scales with active users |
+| forgejo-db | ~37 MB | Postgres tuned: shared_buffers=32MB |
+| forgejo-caddy | ~19 MB | Reverse proxy |
+| **Total used** | **~75 MB** | 180 MB headroom for clone/build/backup |
+
+> Forgejo idles far lower than typical estimates. Bump to 1.5 GB temporarily
+> with `pct set 104 --memory 1536` during heavy operations (large repo
+> migrations, bulk mirrors), then restore to 256 MB.
+
+---
+
+## GitHub Mirror Management (LXC 104)
+
+### What's mirrored
+
+All 13 **PRIVATE** repos from `SREbuilt` GitHub account are mirrored to
+Forgejo org `github-mirror`. Pull mirror, 10 min poll interval. Public
+repos NOT mirrored (excluded by design).
+
+```bash
+# List all mirrors
+curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
+    | jq -r '.[] | "\(.name)\t\(.size)KB\t\(.mirror_updated)"'
+```
+
+### Adding new repos
+
+If you create a new private repo on GitHub:
+
+```bash
+# On PVE host
+export GITHUB_PAT=$(cat /root/.github-pat 2>/dev/null || gh auth token)
+export FORGEJO_TOKEN=$(cat /root/.forgejo-token)
+/root/mirror-github-to-forgejo.sh    # idempotent, only adds missing
+```
+
+### Force immediate sync
+
+```bash
+# Sync one repo now
+curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/repos/github-mirror/<repo>/mirror-sync"
+
+# Sync ALL repos now
+for r in $(curl -ks -H "Authorization: token $(cat /root/.forgejo-token)" \
+    "https://192.168.178.84/api/v1/orgs/github-mirror/repos?limit=50" \
+    | jq -r '.[].name'); do
+    curl -ksX POST -H "Authorization: token $(cat /root/.forgejo-token)" \
+        "https://192.168.178.84/api/v1/repos/github-mirror/${r}/mirror-sync"
+done
+```
+
+### Monitoring
+
+| Cron | When | What |
+|------|------|------|
+| `forgejo-mirror-health` | Daily 06:00 | Alert if any mirror not synced in >2h |
+| `forgejo-bundle-snapshot` | Weekly Monday 04:00 | Git bundle ALL mirrored repos → NAS |
+| `forgejo-backup` | Daily 03:00 | Forgejo DB + dump to `/var/lib/forgejo-backups/` |
+
+Logs:
+- `/var/log/forgejo-mirror-health.log`
+- `/var/log/forgejo-bundle-snapshot.log`
+- `/var/log/forgejo-backup.log`
+
+### True backup vs. replica
+
+| Mechanism | Type | Where | Survives GitHub force-push? |
+|-----------|------|-------|---------------------------|
+| Forgejo pull mirror | **Replica** | LXC 104 | ❌ No (follows ref deletion) |
+| Weekly Git bundles | **Backup** | NAS `/mnt/nas-praxis/backups/git-bundles/` | ✅ Yes (point-in-time) |
+
+To restore from a Git bundle:
+```bash
+git clone /mnt/nas-praxis/backups/git-bundles/2026-05-17/repo.bundle restored-repo
+```
+
+### Token rotation
+
+The GitHub PAT is stored encrypted in Forgejo's DB (one copy per mirror,
+~13 copies). To rotate:
+
+```bash
+# Get new PAT from GitHub (fine-grained, Contents+Metadata read-only)
+# Then for each mirror, update via Forgejo UI:
+# https://192.168.178.84/github-mirror/<repo>/settings → Mirror Settings → "Edit"
+```
+
+Or via API (per repo): `PATCH /api/v1/repos/{owner}/{repo}` with new
+`mirror_address`. Plan to script this if needed.
+
+### Mirror scope: PRIVATE only (current decision)
+
+Public SREbuilt repos are deliberately **not** mirrored. They are
+already public on GitHub and don't need a local backup priority. To
+include them in the future:
+
+```bash
+/root/mirror-github-to-forgejo.sh --include-public
 ```
