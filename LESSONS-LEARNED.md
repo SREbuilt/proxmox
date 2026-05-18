@@ -21,6 +21,7 @@
 - [12. Allgemeine Shell-Script-Patterns](#12-allgemeine-shell-script-patterns)
 - [13. Credentials und Secrets](#13-credentials-und-secrets)
 - [14. Anti-Patterns (Was NICHT funktioniert)](#14-anti-patterns-was-nicht-funktioniert)
+- [15. Windows-zu-Linux Script Authoring](#15-windows-zu-linux-script-authoring)
 
 ---
 
@@ -742,6 +743,140 @@ history -c && rm -f ~/.bash_history
 
 ---
 
+## 15. Windows-zu-Linux Script Authoring
+
+> ⚠️ **Recurring trap** — wir hatten diese Probleme mehrfach. Wer auf Windows
+> Scripts schreibt und auf einen Linux-Host (PVE, LXC, VM) deployt, MUSS
+> diese Regeln beachten.
+
+### Symptom: CRLF-Zeilenenden brechen Bash-Scripts
+
+Windows-Editoren (PowerShell, Notepad, VS Code mit Default-Settings) schreiben
+**CRLF** (`\r\n`) Zeilenenden. Bash interpretiert das `\r` als Teil eines
+Tokens. Fehlerbilder:
+
+```
+./setup.sh: line 87: syntax error near unexpected token `$'in\r''
+./setup.sh: line 335: $'\r': command not found
+./setup.sh: case statement falls through unexpectedly
+shebang #!/bin/bash interpreted as #!/bin/bash\r → "No such file"
+```
+
+### Lösung 1 — `.gitattributes` (BEVORZUGT, automatisch)
+
+Erstelle/aktualisiere `.gitattributes` im Repo-Root:
+
+```gitattributes
+*.sh text eol=lf
+*.bash text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+```
+
+**Bei Bedarf:** `core.autocrlf` auf `input` setzen (Checkin: LF, Checkout:
+unverändert), damit Git keine CR-Einfügungen macht:
+
+```bash
+git config core.autocrlf input
+```
+
+Vorhandene Dateien einmalig konvertieren:
+
+```powershell
+$file = "D:\repo\setup.sh"
+$content = [System.IO.File]::ReadAllText($file) -replace "`r`n","`n"
+[System.IO.File]::WriteAllText($file, $content)
+```
+
+### Lösung 2 — defensiver `sed` am Anfang (Workaround)
+
+Falls Lösung 1 nicht möglich/vergessen:
+
+```bash
+ssh root@<host> 'sed -i "s/\r$//" /root/setup-script.sh && chmod +x /root/setup-script.sh'
+```
+
+In Setup-Anleitungen IMMER als ersten Schritt nach `scp` aufnehmen.
+
+### Symptom: PowerShell expandiert `$(...)` vor SSH-Übergabe
+
+```powershell
+# ❌ Doppelte Quotes lassen PowerShell expandieren
+ssh root@host "NEW_PW=$(openssl rand -base64 16); echo $NEW_PW"
+# → 'openssl' is not recognized as a cmdlet
+```
+
+PowerShell interpretiert `$(openssl ...)` und `$NEW_PW` **bevor** sie an SSH
+gehen — auf Windows-Seite ist openssl nicht installiert, Fehler.
+
+**Lösung:** Single quotes verwenden, dann läuft alles serverseitig:
+
+```powershell
+# ✅ Single quotes → Code geht 1:1 an Linux
+ssh root@host 'NEW_PW=$(openssl rand -base64 16); echo $NEW_PW'
+```
+
+Bei Mischung (Variablen aus PS einbauen, Rest serverseitig): String-Bau
+mit `+` und Escape oder externe Datei via `scp`.
+
+### Symptom: Pipe-Encoding bricht UTF-8 in Dateinamen/Inhalt
+
+PowerShell Pipes nutzen standardmäßig **Windows-1252**, nicht UTF-8. Bei
+`Get-Content | ssh` werden UTF-8-Multibyte-Sequenzen falsch übersetzt.
+
+**Lösung:** Beim Schreiben/Lesen explizit UTF-8 erzwingen:
+
+```powershell
+[System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($file, $content, [System.Text.Encoding]::UTF8)
+```
+
+Oder ganz vermeiden: Dateien direkt via `scp` übertragen (Binär-sicher):
+
+```powershell
+scp D:\repo\script.sh root@host:/root/
+```
+
+### Symptom: `Get-ChildItem` zeigt CRLF-Files mit "Mode -a---" auch nach Edit
+
+VS Code (Default seit 2019) erkennt LF/CRLF und behält das **vorhandene**
+Format bei. Wenn die Datei mit CRLF angelegt wurde, bleibt CRLF — unsichtbar.
+
+**Lösung:** In VS Code unten rechts in der Statusleiste auf `CRLF` klicken
+→ `LF` auswählen → speichern. Oder global in `settings.json`:
+
+```json
+"files.eol": "\n"
+```
+
+### Checklist vor jedem neuen Linux-Script auf Windows
+
+```
+□ .gitattributes erweitert für die Datei-Erweiterung?
+□ Editor (VS Code) auf LF konfiguriert (Statusleiste prüfen)
+□ Script per scp übertragen (nicht copy-paste in nano)
+□ Nach scp defensives `sed -i 's/\r$//' /path/to/script.sh`
+□ `bash -n /path/to/script.sh` vor `chmod +x` für Syntax-Check
+□ Bei PowerShell-SSH: Single quotes außen, keine $(...) auf PS-Seite
+□ Bei Heredocs durch SSH: Single-quoted-EOF (`<< 'EOF'`) gegen Expansion
+```
+
+### Symptom: Cron-Job auf Linux funktioniert manuell, nicht aus Cron
+
+Nicht Windows-spezifisch, aber gleiches Symptom: "command not found" für
+`pct`, `docker`, etc. Cron läuft mit minimalem PATH (`/usr/bin:/bin`).
+
+**Lösung:** Erste Zeile in `/etc/cron.d/<job>`:
+
+```
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+Plus absolute Pfade im Script (`/usr/sbin/pct` statt `pct`).
+
+---
+
 ## Chronologie der Entdeckungen
 
 | # | Was | Wie entdeckt | Dauer bis Fix |
@@ -770,3 +905,6 @@ history -c && rm -f ~/.bash_history
 | 22 | PowerShell `$(...)` Substitution vor SSH | `'openssl' is not recognized` | Single quotes um SSH command — PS expandiert sonst auf Client-Seite |
 | 23 | Bind-mount in unprivilegierter LXC nicht beschreibbar | `open /backups/...: permission denied` (Docker cp / forgejo dump) | Host-Dir muss `100000:100000` gehören (PVE UID 100000 = LXC UID 0). `chown 100000:100000 /var/lib/forgejo-backups` |
 | 24 | Cron-PATH ohne `/usr/sbin` | `pct: command not found` in cron log | `PATH=/usr/sbin:/usr/bin:/sbin:/bin` als erste Zeile der `/etc/cron.d/*` Datei, oder absoluten Pfad im Script nutzen |
+| 25 | Windows-Editor speichert Scripts mit CRLF | `syntax error near unexpected token $'in\r''`, `$'\r': command not found` | `.gitattributes` mit `*.sh text eol=lf` + defensives `sed -i 's/\r$//'` nach `scp` |
+| 26 | PowerShell `$(...)` Substitution vor SSH-Aufruf | `'openssl' is not recognized as a cmdlet` (PS versucht clientseitig zu expandieren) | Single quotes um den ssh-Befehl statt Double quotes — kein PS-Parsing |
+| 27 | PowerShell Pipes nutzen Windows-1252 statt UTF-8 | Multibyte-Zeichen werden zerlegt, Emojis kaputt | `[System.IO.File]::WriteAllText($f, $c, [Text.Encoding]::UTF8)` oder `scp` statt `Get-Content \| ssh` |

@@ -586,6 +586,87 @@ pve-firewall restart
 
 ---
 
+## ⚠️ Authoring Scripts on Windows for Linux
+
+> If you author or edit scripts on a Windows PC and deploy them to
+> Proxmox/LXCs/VMs, follow this checklist EVERY TIME. We hit CRLF and
+> related issues repeatedly — these are the proven fixes.
+
+### Repo-level (one-time setup)
+
+```bash
+# In repo root:
+cat > .gitattributes << 'EOF'
+*.sh text eol=lf
+*.bash text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+EOF
+
+git config core.autocrlf input
+```
+
+This forces `.sh` files to LF on checkin and prevents Git from inserting
+CRs at checkout on Windows. **Already configured in this repo.**
+
+### Editor (VS Code)
+
+`settings.json`:
+```json
+{
+  "files.eol": "\n",
+  "files.encoding": "utf8"
+}
+```
+
+Check the status bar (bottom-right): should show `LF` and `UTF-8`. Click
+to change if needed.
+
+### Per-script checklist before deploying
+
+```bash
+# 1. Convert any leftover CRLF (PowerShell)
+$f = "D:\repo\setup.sh"
+[System.IO.File]::WriteAllText($f, ([System.IO.File]::ReadAllText($f) -replace "`r`n","`n"))
+
+# 2. Transfer via scp (NOT copy-paste into nano)
+scp setup.sh root@<host>:/root/
+
+# 3. ALWAYS run defensive sed after scp (belt-and-suspenders)
+ssh root@<host> 'sed -i "s/\r$//" /root/setup.sh && chmod +x /root/setup.sh'
+
+# 4. Validate syntax before executing
+ssh root@<host> 'bash -n /root/setup.sh && echo SYNTAX_OK'
+
+# 5. Then run
+ssh root@<host> '/root/setup.sh'
+```
+
+### PowerShell-to-SSH gotcha: command substitution
+
+```powershell
+# ❌ DOUBLE quotes — PowerShell expands $() and $var CLIENT-side
+ssh root@host "PW=$(openssl rand -base64 16); echo $PW"
+# → 'openssl' is not recognized as a cmdlet
+
+# ✅ SINGLE quotes — string passes verbatim, Linux evaluates
+ssh root@host 'PW=$(openssl rand -base64 16); echo $PW'
+```
+
+### Why this matters
+
+A CRLF in a shell script causes:
+- `syntax error near unexpected token $'in\r''`
+- `$'\r': command not found`
+- Silent `case` fall-through (CR makes patterns never match)
+- `#!/bin/bash\r` → "No such file or directory" on first line
+
+See `LESSONS-LEARNED.md` section 15 for full details and entries
+#25, #26, #27 in the chronology.
+
+---
+
 ## Option 4: Shared Whisper LXC (Voice Transcription)
 
 **Best for**: Shared speech-to-text service used by both OpenClaw and Hermes
