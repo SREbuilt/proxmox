@@ -1055,20 +1055,25 @@ The script (11 steps):
 ### Connect from your workstation
 
 **Browser UI** (graph visualization, cypher editor):
-- https://192.168.178.87/ (accept self-signed cert)
+- **Recommended**: https://192.168.178.87:7473/browser/ (Neo4j's own HTTPS — no proxy)
+- Alternative: https://192.168.178.87/browser/ (via Caddy)
+- Accept self-signed cert (one-time)
+- Connect URL: **`neo4j+s://192.168.178.87:7687`** (use `bolt+ssc://` if cert is rejected)
 - Login: `neo4j` / *(password printed at end of setup)*
 
 **Bolt driver** (Python, Node.js, Java, Go, etc.):
 ```python
 from neo4j import GraphDatabase
-driver = GraphDatabase.driver("bolt://192.168.178.87:7687",
+driver = GraphDatabase.driver("neo4j+ssc://192.168.178.87:7687",
                               auth=("neo4j", "YOUR_PASSWORD"))
 ```
 
 **cypher-shell** (CLI):
 ```bash
-cypher-shell -a bolt://192.168.178.87:7687 -u neo4j -p 'YOUR_PASSWORD'
+cypher-shell -a bolt+ssc://192.168.178.87:7687 -u neo4j -p 'YOUR_PASSWORD'
 ```
+
+📖 **See `USER-MANUAL-NEO4J.md` for the full user guide**, including driver examples for all languages, CSV import, restore procedures, and troubleshooting.
 
 ### Troubleshooting
 
@@ -1079,6 +1084,7 @@ cypher-shell -a bolt://192.168.178.87:7687 -u neo4j -p 'YOUR_PASSWORD'
 | Neo4j refuses connection (`Bolt`) | Container still starting (60-90s) | Wait — health check has 90s start_period |
 | Backup script fails in cron, works manually | Cron PATH missing `/usr/sbin` | `PATH=/usr/sbin:...` in `/etc/cron.d/` (script does this) |
 | HTTPS handshake fails | Caddy `tls internal` IP-only SAN issue | Script pre-generates cert with `openssl req` (IP + hostname SANs) |
+| **Browser login "Failed to fetch"** | **HTTPS Browser blocked from `bolt://` (mixed-content)** | **Use `neo4j+s://` or `bolt+ssc://` connect URL — script enables Bolt TLS** |
 
 ---
 

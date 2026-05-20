@@ -927,13 +927,18 @@ cd /opt/neo4j
 # Install cypher-shell first
 apt install cypher-shell
 
-# Connect
-cypher-shell -a bolt://192.168.178.87:7687 -u neo4j -p '<PASSWORD>'
+# Connect with TLS (accepts self-signed cert)
+cypher-shell -a bolt+ssc://192.168.178.87:7687 -u neo4j -p '<PASSWORD>'
 
-# Or via the Browser UI: https://192.168.178.87/
-# → Connect URL: bolt://192.168.178.87:7687
-# → user: neo4j, pw: <PASSWORD>
+# Or via the Browser UI: https://192.168.178.87:7473/browser/ (recommended)
+# OR via Caddy:          https://192.168.178.87/browser/
+# Connect URL:           neo4j+s://192.168.178.87:7687  (or bolt+ssc:// for self-signed)
+# user: neo4j, pw: <PASSWORD>
 ```
+
+> **Why `+s` / `+ssc` and not plain `bolt://`?** Modern browsers block insecure
+> WebSocket connections from HTTPS pages (mixed content). Bolt TLS is configured
+> in the compose env vars and uses the same self-signed cert as Caddy.
 
 ### Backup & restore
 

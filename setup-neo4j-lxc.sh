@@ -259,6 +259,7 @@ policy_out: DROP
 IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 22 -log nolog
 IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 80 -log nolog
 IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 443 -log nolog
+IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 7473 -log nolog
 IN ACCEPT -source 192.168.178.0/24 -p tcp -dport 7687 -log nolog
 IN ACCEPT -p icmp -log nolog
 
@@ -271,7 +272,7 @@ OUT ACCEPT -p tcp -dport 443 -log nolog
 OUT ACCEPT -p icmp -log nolog
 EOF
 
-ok "Firewall configured (Bolt 7687 + HTTPS/HTTP + SSH from LAN, LAN egress blocked)"
+ok "Firewall configured (Bolt 7687 + Neo4j HTTPS 7473 + Caddy 80/443 + SSH from LAN)"
 
 ###############################################################################
 # Step 6/11: Start LXC + wait for SSH
@@ -331,6 +332,19 @@ info "  Generating self-signed cert..."
 $SSH_CMD "root@${CT_IP}" "mkdir -p /opt/neo4j/certs && openssl req -x509 -nodes -days 3650 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -keyout /opt/neo4j/certs/key.pem -out /opt/neo4j/certs/cert.pem -subj '/CN=neo4j.lan' -addext 'subjectAltName=DNS:neo4j.lan,DNS:neo4j,DNS:localhost,IP:${CT_IP},IP:127.0.0.1' -addext 'keyUsage=digitalSignature,keyEncipherment' -addext 'extendedKeyUsage=serverAuth' 2>&1 | tail -1"
 ok "  Self-signed cert generated"
 
+# Mirror the cert into Neo4j's required ssl/{bolt,https} subdirs
+# Neo4j 5 expects private.key + public.crt in dedicated dirs per policy
+info "  Setting up SSL directory structure for Neo4j Bolt+HTTPS..."
+$SSH_CMD "root@${CT_IP}" "
+    mkdir -p /opt/neo4j/ssl/bolt /opt/neo4j/ssl/https
+    cp /opt/neo4j/certs/key.pem  /opt/neo4j/ssl/bolt/private.key
+    cp /opt/neo4j/certs/cert.pem /opt/neo4j/ssl/bolt/public.crt
+    cp /opt/neo4j/certs/key.pem  /opt/neo4j/ssl/https/private.key
+    cp /opt/neo4j/certs/cert.pem /opt/neo4j/ssl/https/public.crt
+    chmod 644 /opt/neo4j/ssl/bolt/private.key /opt/neo4j/ssl/https/private.key
+"
+ok "  SSL dirs ready (bolt/ + https/ with cert + key)"
+
 # Caddyfile
 $SSH_CMD "root@${CT_IP}" "cat > /opt/neo4j/Caddyfile" << 'CADDY_EOF'
 {
@@ -362,21 +376,38 @@ services:
       - NEO4J_server_default__advertised__address=${CT_IP}
       - NEO4J_server_bolt_advertised__address=${CT_IP}:7687
       - NEO4J_server_http_advertised__address=${CT_IP}:7474
+      - NEO4J_server_https_advertised__address=${CT_IP}:7473
       # Memory tuning for 2 GB LXC
       - NEO4J_server_memory_heap_initial__size=512m
       - NEO4J_server_memory_heap_max__size=512m
       - NEO4J_server_memory_pagecache_size=512m
       - NEO4J_db_memory_transaction_total_max=256m
+      # Bolt TLS — REQUIRED so the HTTPS Browser can connect via bolt+s://
+      - NEO4J_server_bolt_tls__level=OPTIONAL
+      - NEO4J_dbms_ssl_policy_bolt_enabled=true
+      - NEO4J_dbms_ssl_policy_bolt_base__directory=/ssl/bolt
+      - NEO4J_dbms_ssl_policy_bolt_private__key=private.key
+      - NEO4J_dbms_ssl_policy_bolt_public__certificate=public.crt
+      - NEO4J_dbms_ssl_policy_bolt_client__auth=NONE
+      # HTTPS on Neo4j itself (7473) — recommended login URL
+      - NEO4J_server_https_enabled=true
+      - NEO4J_dbms_ssl_policy_https_enabled=true
+      - NEO4J_dbms_ssl_policy_https_base__directory=/ssl/https
+      - NEO4J_dbms_ssl_policy_https_private__key=private.key
+      - NEO4J_dbms_ssl_policy_https_public__certificate=public.crt
+      - NEO4J_dbms_ssl_policy_https_client__auth=NONE
       # Accept license for Community (Apache 2.0)
       - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
     ports:
       - "7687:7687"
+      - "7473:7473"
     volumes:
       - neo4j-data:/data
       - neo4j-logs:/logs
       - neo4j-plugins:/plugins
       - neo4j-conf:/conf
       - neo4j-import:/import
+      - ./ssl:/ssl:ro
       - /backups:/backups
       - /nas-backups:/nas-backups
     networks:
@@ -563,18 +594,23 @@ echo "  LXC IP:           $CT_IP"
 echo "  LXC root pw:      $PASSWORD"
 echo "  SSH:              ssh root@${CT_IP}"
 echo ""
-echo "  Neo4j Browser:    https://${CT_IP}/  (self-signed cert)"
+echo "  Neo4j Browser:    https://${CT_IP}:7473/browser/   ← RECOMMENDED"
+echo "                    (or: https://${CT_IP}/browser/  via Caddy)"
 echo "  Neo4j user:       neo4j"
 echo "  Neo4j password:   ${NEO4J_PASSWORD}"
-echo "  Bolt URL:         bolt://${CT_IP}:7687"
-echo "  HTTP API:         http://${CT_IP}/  (redirects to https)"
 echo ""
-echo "  Backups:          /var/lib/neo4j-backups/ (PVE)        — 7 retained"
+echo "  Connect URL:      neo4j+s://${CT_IP}:7687"
+echo "                    (or bolt+ssc://${CT_IP}:7687 if cert is rejected)"
+echo "  HTTP API:         https://${CT_IP}:7473/  (Neo4j native HTTPS)"
+echo ""
+echo "  Backups:          /var/lib/neo4j-backups/ (PVE)         — 7 retained"
 echo "                    \\\\brain\\backups\\proxmox\\neo4j (NAS)  — 30 retained"
 echo "                    Daily at 03:00"
 echo ""
+echo "  User manual:      USER-MANUAL-NEO4J.md (in repo)"
+echo ""
 echo "  Connect from another host (cypher-shell):"
-echo "    cypher-shell -a bolt://${CT_IP}:7687 -u neo4j -p '${NEO4J_PASSWORD}'"
+echo "    cypher-shell -a bolt+ssc://${CT_IP}:7687 -u neo4j -p '${NEO4J_PASSWORD}'"
 echo ""
 echo "  Manual backup:    ssh root@${CT_IP} neo4j-backup"
 echo ""
