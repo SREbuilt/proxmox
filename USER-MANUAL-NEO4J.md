@@ -425,9 +425,14 @@ Already created for the smart-home dependency project:
 | Field | Value |
 |-------|-------|
 | Username | `llm_smarthome` |
-| Password | `SmartHomeGraph2026!LLM` |
+| Password | **Ask the operator** (stored in your password manager, NEVER committed) |
 | Scope | Full read+write on default database (Community Edition has no RBAC) |
 | Purpose | Smart home dependency graph ingestion + queries |
+
+> 🔐 **Credentials handling**: The password is never written in this repo or
+> any commit. It's printed once during deployment and must be stored in your
+> password manager (KeePassXC, Bitwarden, 1Password). When using it in code,
+> pass via env var (e.g. `NEO4J_PASSWORD`) — see examples below.
 
 ### Important caveat — Community Edition has NO roles
 
@@ -485,21 +490,22 @@ pip install neo4j
 ```
 
 ```python
+import os
 from neo4j import GraphDatabase
 
-# Connection
 URI = "bolt+ssc://192.168.178.87:7687"   # self-signed cert tolerant
-AUTH = ("llm_smarthome", "SmartHomeGraph2026!LLM")
+AUTH = (
+    os.environ["NEO4J_USER"],         # set NEO4J_USER=llm_smarthome
+    os.environ["NEO4J_PASSWORD"],     # set NEO4J_PASSWORD=<your-pw>
+)
 
 driver = GraphDatabase.driver(URI, auth=AUTH)
 driver.verify_connectivity()
 
-# Read
 with driver.session() as session:
     result = session.run("MATCH (n) RETURN count(n) AS count")
     print(f"Total nodes: {result.single()['count']}")
 
-# Write (idempotent — use MERGE not CREATE)
 with driver.session() as session:
     session.run("""
         MERGE (d:Device {id: $id})
@@ -509,6 +515,13 @@ with driver.session() as session:
     """, id="sensor.living_room_temperature", name="Living Room Temperature")
 
 driver.close()
+```
+
+Set the env vars before running:
+```bash
+export NEO4J_USER=llm_smarthome
+read -s NEO4J_PASSWORD && export NEO4J_PASSWORD   # paste, no echo
+python my_script.py
 ```
 
 ### Node.js / TypeScript
@@ -522,7 +535,10 @@ import neo4j from 'neo4j-driver';
 
 const driver = neo4j.driver(
     'bolt+ssc://192.168.178.87:7687',
-    neo4j.auth.basic('llm_smarthome', 'SmartHomeGraph2026!LLM')
+    neo4j.auth.basic(
+        process.env.NEO4J_USER,        // llm_smarthome
+        process.env.NEO4J_PASSWORD,    // from your password manager
+    )
 );
 
 const session = driver.session();
@@ -543,14 +559,20 @@ try {
 For one-off scripts or LLMs that don't want a Bolt driver:
 
 ```bash
+# Put creds in a netrc-style file — DO NOT inline in commands/scripts
+cat > ~/.neo4j-curl-auth << 'EOF'
+user = "llm_smarthome:<YOUR_PASSWORD_FROM_PASSWORD_MANAGER>"
+EOF
+chmod 600 ~/.neo4j-curl-auth
+
 # Read query
-curl -ks -u 'llm_smarthome:SmartHomeGraph2026!LLM' \
+curl -ks -K ~/.neo4j-curl-auth \
     https://192.168.178.87:7473/db/neo4j/tx/commit \
     -H 'Content-Type: application/json' \
     -d '{"statements":[{"statement":"MATCH (n) RETURN count(n) AS count"}]}'
 
 # Write query (MERGE)
-curl -ks -u 'llm_smarthome:SmartHomeGraph2026!LLM' \
+curl -ks -K ~/.neo4j-curl-auth \
     https://192.168.178.87:7473/db/neo4j/tx/commit \
     -H 'Content-Type: application/json' \
     -d '{
@@ -567,10 +589,14 @@ and explicit BEGIN/COMMIT/ROLLBACK (see Neo4j HTTP API docs).
 ### Bash one-liner via cypher-shell
 
 ```bash
+# Use NEO4J_PASSWORD env var — never inline a literal password
+export NEO4J_USER=llm_smarthome
+read -s NEO4J_PASSWORD && export NEO4J_PASSWORD
+
 echo 'MATCH (n) RETURN count(n);' \
     | ssh root@192.168.178.108 \
-        'pct exec 107 -- docker exec -i neo4j cypher-shell \
-           -a bolt://localhost:7687 -u llm_smarthome -p "SmartHomeGraph2026!LLM"'
+        "pct exec 107 -- docker exec -i -e NEO4J_USER -e NEO4J_PASSWORD neo4j cypher-shell \
+           -a bolt://localhost:7687 -u \"\$NEO4J_USER\" -p \"\$NEO4J_PASSWORD\""
 ```
 
 ## 15. Ingestion Patterns (Important!)
@@ -709,8 +735,9 @@ Copy-paste this into a new Copilot CLI / Claude / GPT session to bootstrap:
 >
 > **Service account for this project**:
 > - Username: `llm_smarthome`
-> - Password: `SmartHomeGraph2026!LLM`
+> - Password: \<ASK THE OPERATOR — stored in their password manager, never in repo\>
 > - Endpoint: `bolt+ssc://192.168.178.87:7687`
+> - Recommended: read it once at start of session into env var `NEO4J_PASSWORD`
 >
 > **Constraints**:
 > - Community Edition: every user has admin rights, no RBAC. Use the
@@ -758,6 +785,7 @@ ssh root@192.168.178.108 'pct exec 107 -- docker stats --no-stream neo4j'
 ssh root@192.168.178.108 'pct exec 107 -- docker exec neo4j du -sh /data/databases/neo4j /data/transactions/neo4j'
 
 # HTTP health probe (returns "pass" for healthy)
-curl -ks https://192.168.178.87:7473/db/neo4j/cluster/available -u 'llm_smarthome:SmartHomeGraph2026!LLM'
+curl -ks -K ~/.neo4j-curl-auth \
+    https://192.168.178.87:7473/db/neo4j/cluster/available
 ```
 
