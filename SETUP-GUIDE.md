@@ -993,6 +993,95 @@ shred -u /tmp/github-pat.txt
 
 ---
 
+## Option 9: Neo4j Graph Database LXC ✅ Tested
+
+**Best for**: Self-hosted graph database for relationship-heavy data (knowledge graphs, recommendation systems, code dependencies, social networks). Same proven LXC + Docker + Caddy pattern as Forgejo.
+
+### Architecture
+
+```
+LXC 107 (192.168.178.87) — 2 GB RAM + 512 MB swap, 16 GB disk
+├── Caddy 2 (reverse proxy :80 → :443 self-signed)
+├── Neo4j 5.26.26-community (LTS, pinned)
+│   ├── HTTP/Browser :7474 (internal, behind Caddy)
+│   └── Bolt protocol :7687 (exposed to LAN)
+└── Backup bind-mounts:
+    ├── /backups       → /var/lib/neo4j-backups (PVE, 7 retained)
+    └── /nas-backups   → /mnt/nas-proxmox-backups/proxmox/neo4j (NAS, 30 retained)
+```
+
+### Prerequisites — NAS user
+
+Create on Synology DSM **first**:
+1. User & Group → Create `pve-svc-neo4j-backup` (strong password, no apps enabled)
+2. Shared Folder `backups` → Edit → Permissions → grant `pve-svc-neo4j-backup` **Read/Write**
+
+### Memory tuning for 2 GB LXC
+
+- Neo4j heap (init+max): 512 MB
+- Page cache: 512 MB
+- Tx memory cap: 256 MB
+- Caddy + OS + Docker: ~500 MB
+- Headroom: ~500 MB
+
+### Step-by-Step
+
+```bash
+scp setup-neo4j-lxc.sh root@<PROXMOX_IP>:/root/
+ssh root@<PROXMOX_IP>
+chmod +x /root/setup-neo4j-lxc.sh
+sed -i 's/\r$//' /root/setup-neo4j-lxc.sh
+
+# Pass NAS credentials via flags
+/root/setup-neo4j-lxc.sh \
+    --ssh-pubkey /root/.ssh/id_ed25519.pub \
+    --smb-user pve-svc-neo4j-backup \
+    --smb-password 'YOUR_NAS_PASSWORD'
+```
+
+The script (11 steps):
+1. Downloads Debian 12 template
+2. Mounts NAS share `\\brain\backups` via CIFS (creates creds file, persists in `/etc/fstab`), creates `proxmox/neo4j/` subfolder, writes test
+3. Prepares local backup dir with `chown 100000:100000` (unprivileged LXC UID mapping)
+4. Creates LXC 107 with both bind-mounts
+5. Hardens firewall (Bolt 7687 + HTTPS/HTTP + SSH from LAN, RFC1918 outbound blocked)
+6. Starts LXC, waits for SSH
+7. Installs Docker
+8. Pre-generates self-signed cert (IP + hostname SANs), deploys Neo4j + Caddy
+9. Installs 2-tier backup script + daily cron at 03:00
+10. Runs initial backup, verifies both tiers
+11. Enables firewall
+
+### Connect from your workstation
+
+**Browser UI** (graph visualization, cypher editor):
+- https://192.168.178.87/ (accept self-signed cert)
+- Login: `neo4j` / *(password printed at end of setup)*
+
+**Bolt driver** (Python, Node.js, Java, Go, etc.):
+```python
+from neo4j import GraphDatabase
+driver = GraphDatabase.driver("bolt://192.168.178.87:7687",
+                              auth=("neo4j", "YOUR_PASSWORD"))
+```
+
+**cypher-shell** (CLI):
+```bash
+cypher-shell -a bolt://192.168.178.87:7687 -u neo4j -p 'YOUR_PASSWORD'
+```
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `Unrecognized setting: dbms.backup.enabled` | Enterprise-only flag in compose env | Remove `NEO4J_dbms_backup_enabled=true` — Community doesn't have it |
+| NAS copy "Permission denied" inside LXC | CIFS `uid=0` maps to "nobody" inside unprivileged LXC | Mount with `uid=100000,gid=100000` (script does this) |
+| Neo4j refuses connection (`Bolt`) | Container still starting (60-90s) | Wait — health check has 90s start_period |
+| Backup script fails in cron, works manually | Cron PATH missing `/usr/sbin` | `PATH=/usr/sbin:...` in `/etc/cron.d/` (script does this) |
+| HTTPS handshake fails | Caddy `tls internal` IP-only SAN issue | Script pre-generates cert with `openssl req` (IP + hostname SANs) |
+
+---
+
 ## Post-Setup: Connecting Channels
 
 After setup, configure your messaging channels:
