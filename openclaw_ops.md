@@ -9,11 +9,12 @@
 
 | ID | Typ | Name | IP | RAM | Funktion | Setup-Script |
 |----|-----|------|----|-----|----------|-------------|
-| 100 | VM | openclaw | 192.168.178.80 | 4 GB | OpenClaw AI Assistant | `niklas_setup-openclaw-vm.sh` |
+| 100 | VM | openclaw | 192.168.178.80 | 4 GB | OpenClaw AI Assistant *(decommissioned)* | `niklas_setup-openclaw-vm.sh` |
 | 101 | VM | hermes-agent | 192.168.178.81 | 3 GB | Hermes AI Agent | `setup-hermes-vm.sh` |
 | 102 | LXC | whisper | 192.168.178.82 | 1 GB | Shared Whisper STT | `setup-whisper-lxc.sh` |
 | 103 | LXC | invoicing | 192.168.178.83 | 2 GB | e-Invoice (Batch + Web :8080) | `setup-einvoice-lxc.sh` |
 | 104 | LXC | forgejo | 192.168.178.84 | 256 MB | Self-hosted Git forge | `setup-forgejo-lxc.sh` |
+| 107 | LXC | neo4j | 192.168.178.87 | 2 GB | Graph database (Neo4j 5 LTS) | `setup-neo4j-lxc.sh` |
 | 108 | VM | haos151 | 192.168.178.88 | 6.5 GB | Home Assistant OS (prod) | `setup-haos-vm.sh` |
 
 > Für Hermes-spezifische Dokumentation: siehe `SETUP-GUIDE.md`, Option 3.
@@ -899,3 +900,106 @@ include them in the future:
 ```bash
 /root/mirror-github-to-forgejo.sh --include-public
 ```
+
+---
+
+## Neo4j LXC Management (LXC 107)
+
+### Access
+
+```bash
+# From PVE host
+pct enter 107
+
+# Working directory
+cd /opt/neo4j
+
+# Web Browser UI (self-signed cert, accept warning)
+# https://192.168.178.87/
+
+# Bolt protocol (drivers, cypher-shell)
+# bolt://192.168.178.87:7687
+```
+
+### Connect from another host
+
+```bash
+# Install cypher-shell first
+apt install cypher-shell
+
+# Connect
+cypher-shell -a bolt://192.168.178.87:7687 -u neo4j -p '<PASSWORD>'
+
+# Or via the Browser UI: https://192.168.178.87/
+# → Connect URL: bolt://192.168.178.87:7687
+# → user: neo4j, pw: <PASSWORD>
+```
+
+### Backup & restore
+
+```bash
+# Manual backup (PVE host)
+pct exec 107 -- neo4j-backup
+
+# Backups live on PVE host (bind-mounted to /backups inside LXC)
+ls -lh /var/lib/neo4j-backups/
+
+# Backups also on NAS at \\brain\backups\proxmox\neo4j\
+ls -lh /mnt/nas-proxmox-backups/proxmox/neo4j/
+
+# Restore (database must be stopped first)
+pct enter 107
+cd /opt/neo4j
+docker compose stop neo4j
+docker compose run --rm -v neo4j_neo4j-data:/data -v /backups:/backups --entrypoint "" neo4j \
+    neo4j-admin database load neo4j --from-path=/backups --overwrite-destination=true \
+    --from-file=neo4j-YYYYMMDD-HHMMSS.dump
+docker compose start neo4j
+```
+
+### Update Neo4j (within 5.x LTS line)
+
+```bash
+# Edit /opt/neo4j/docker-compose.yml — change image tag (e.g., 5.26.27-community)
+# Backup FIRST
+pct exec 107 -- neo4j-backup
+# Pull new image and recreate
+pct exec 107 -- bash -c "cd /opt/neo4j && docker compose pull neo4j && docker compose up -d neo4j"
+```
+
+### Docker stack management
+
+```bash
+pct enter 107
+cd /opt/neo4j
+docker compose ps
+docker compose logs -f neo4j
+docker compose restart neo4j
+docker compose down && docker compose up -d
+```
+
+### Backup tiers
+
+| Tier | Where | Retention | When |
+|------|-------|-----------|------|
+| Local | `/var/lib/neo4j-backups/` (PVE host) | 7 dumps | Daily 03:00 |
+| NAS | `\\brain\backups\proxmox\neo4j\` (CIFS) | 30 dumps | Daily 03:00 (right after local) |
+
+Logs: `/var/log/neo4j-backup.log` inside LXC 107
+
+### Security notes
+
+- **Outbound firewall** blocks RFC1918 (no LAN sniffing)
+- **Self-signed cert** valid 10 years, IP+hostname SANs
+- **NEO4J_AUTH** at first start sets the admin password; afterwards it's stored in `/data/dbms/auth`
+- **Bolt port 7687** is the only DB protocol port exposed (no internal Postgres-style backdoor)
+- **NAS service account** `pve-svc-neo4j-backup` has Read/Write on the `backups` share only, no DSM access
+
+### Memory budget (2 GB)
+
+| Container | Configured | Notes |
+|-----------|------------|-------|
+| neo4j | 512 MB heap + 512 MB pagecache | Tuned via NEO4J_server_memory_* env vars |
+| neo4j-caddy | ~15 MB | Reverse proxy |
+| OS + Docker | ~500 MB | |
+| **Headroom** | **~500 MB** | For backups, queries, future plugins |
